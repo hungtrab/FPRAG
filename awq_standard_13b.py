@@ -175,8 +175,16 @@ class GroupWiseAWQAsymmetricL2Quantizer:
 
         del X_cpu
 
+        # Move weights to target device if on meta/cpu (handles device_map="auto" offloading)
         W = module.weight.data
+        if W.device.type == 'meta' or W.device.type == 'cpu':
+            W = W.to(self.device)
+            module.weight.data = W
+        
         b = module.bias.data if module.bias is not None else None
+        if b is not None and (b.device.type == 'meta' or b.device.type == 'cpu'):
+            b = b.to(self.device)
+            module.bias.data = b
 
         # Convert X_search to match weight dtype (bfloat16) for matmul compatibility
         X_search = X_search.to(W.dtype)
@@ -351,11 +359,17 @@ class GroupWiseAWQAsymmetricL2Quantizer:
                         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
                     W = module.weight.data
+                    # Ensure weight is on the target device
+                    if W.device.type == 'meta' or W.device.type == 'cpu':
+                        W = W.to(self.device)
+                    
                     original_dtype = W.dtype
+                    original_device = W.device
                     W_scaled = W * best_scales.unsqueeze(0)
                     W_quant = self.quantize_weight_groupwise_asymmetric(W_scaled)
                     W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
-                    module.weight.data = W_final
+                    # Keep weight on its original device
+                    module.weight.data = W_final.to(original_device)
 
                     self.layer_scales[name] = {
                         'scales': best_scales.cpu(),

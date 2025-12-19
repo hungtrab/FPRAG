@@ -256,7 +256,12 @@ class StandardHeuristicAWQQuantizer:
         if X_search.dtype != module.weight.dtype:
             X_search = X_search.to(module.weight.dtype)
 
+        # Move weights to target device if on meta/cpu (handles device_map="auto" offloading)
         W = module.weight.data
+        if W.device.type == 'meta' or W.device.type == 'cpu':
+            W = W.to(self.device)
+            module.weight.data = W
+        
         Y_orig = torch.matmul(X_search, W.t())
 
         best_error = float('inf')
@@ -301,7 +306,12 @@ class StandardHeuristicAWQQuantizer:
         best_scales, best_alpha, best_error = self.search_best_scale(name, module)
 
         W = module.weight.data
+        # Ensure weight is on the target device
+        if W.device.type == 'meta' or W.device.type == 'cpu':
+            W = W.to(self.device)
+        
         original_dtype = W.dtype
+        original_device = W.device
         W_scaled = W * best_scales.unsqueeze(0)
 
         _, raw_mean = self.get_activation_stats(name)
@@ -317,7 +327,8 @@ class StandardHeuristicAWQQuantizer:
         )
 
         W_final = (W_quant / best_scales.unsqueeze(0)).to(original_dtype)
-        module.weight.data = W_final
+        # Keep weight on its original device
+        module.weight.data = W_final.to(original_device)
 
         self.layer_scales[name] = {
             'scales': best_scales.cpu(),
