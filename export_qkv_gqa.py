@@ -60,10 +60,13 @@ class GQAExtractor:
 
         # Get GQA configuration
         self.config = model.config
-        self.num_heads = getattr(self.config, 'num_attention_heads', None)
-        self.num_key_value_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
+        # Try different config attribute names used by different models
+        self.num_heads = getattr(self.config, 'num_attention_heads', 
+                                 getattr(self.config, 'num_query_heads', None))
+        self.num_key_value_heads = getattr(self.config, 'num_key_value_heads', 
+                                           getattr(self.config, 'num_kv_heads', self.num_heads))
         self.hidden_size = self.config.hidden_size
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(self.config, 'head_dim', self.hidden_size // self.num_heads)
 
         # Calculate number of groups
         self.num_groups = self.num_heads // self.num_key_value_heads if self.num_key_value_heads else 1
@@ -85,8 +88,16 @@ class GQAExtractor:
             base_model = self.model
 
         if hasattr(base_model, 'layers'):
-            # Llama-style architecture
-            return base_model.layers[self.layer_id].self_attn
+            # Llama-style architecture (Llama, Gemma, Mistral, etc.)
+            layer = base_model.layers[self.layer_id]
+            # Check for self_attn (most common)
+            if hasattr(layer, 'self_attn'):
+                return layer.self_attn
+            # Some models use 'attention' instead
+            elif hasattr(layer, 'attention'):
+                return layer.attention
+            else:
+                raise ValueError(f"Layer {self.layer_id} has no self_attn or attention module")
         elif hasattr(base_model, 'transformer') and hasattr(base_model.transformer, 'h'):
             # GPT-style architecture
             return base_model.transformer.h[self.layer_id].attn
@@ -321,7 +332,9 @@ class GQAExtractor:
 def main():
     parser = argparse.ArgumentParser(description='Export GQA Q/K/V weights and activations')
     parser.add_argument('--model-path', type=str, default='./models/Llama-3-8B',
-                        help='Model name or path (default: ./models/Llama-3-8B)')
+                        help='Model name or path (default: ./models/Llama-3-8B). '
+                             'Supports Llama, Gemma, Mistral, and other GQA models. '
+                             'Note: google/gemma-3-4b-it may not exist; use gemma-2-2b-it, gemma-2-9b-it, etc.')
     parser.add_argument('--layer-id', type=int, default=0,
                         help='Layer index to extract from (default: 0)')
     parser.add_argument('--n-samples', type=int, default=128,
@@ -351,12 +364,21 @@ def main():
 
     # Load model
     print(f"\nLoading model: {args.model_path}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    except Exception as e:
+        print(f"Error loading model with bfloat16, trying float16: {e}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
     model.eval()
 
     # Load tokenizer
