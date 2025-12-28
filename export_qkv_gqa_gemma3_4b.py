@@ -80,87 +80,114 @@ class GQAExtractor:
         print(f"Number of groups: {self.num_groups}")
         print(f"===================================\n")
 
-    def _get_attention_module(self):
-        """Get the attention module for the specified layer."""
-        # Handle different model wrappers (e.g., PeftModel wrapping a CausalLM)
-        current_model = self.model
+    def _find_layer_container_heuristic(self, module):
+        """
+        Heuristically find the container holding the transformer layers.
+        This is necessary because model structures vary (Llama, Gemma, Mistral, etc.)
+        and can be wrapped (e.g., by PEFT/LoRA or quantization libraries).
+        """
+        # 1. Check common attribute names
+        candidates = ['layers', 'h', 'blocks', 'stages', 'transformer', 'encoder', 'decoder']
+        for name in candidates:
+            if hasattr(module, name):
+                child = getattr(module, name)
+                # Check if it's a list-like container
+                if isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential, list)):
+                    return child
+                # Check if it has sub-layers (e.g., transformer.layers)
+                if hasattr(child, 'layers') and isinstance(child.layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    return child.layers
+                if hasattr(child, 'h') and isinstance(child.h, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    return child.h
+
+        # 2. If standard names fail, search children for a ModuleList
+        for name, child in module.named_children():
+            if isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential)):
+                print(f"    Heuristic: Found potential layer container via named_children: '{name}'")
+                return child
+            
+            # Recursive check (max depth 2 to avoid infinite loops)
+            if hasattr(child, 'layers') and isinstance(child.layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+                print(f"    Heuristic: Found nested layer container in child '{name}': 'layers'")
+                return child.layers
+            
+            # Specific check for 'model' attribute sometimes wrapping real model
+            if hasattr(child, 'model'):
+                 # Case: wrapper.model
+                 inner = child.model
+                 if hasattr(inner, 'layers'):
+                    return inner.layers
         
-        # 1. Try to unwrap PeftModel or similar wrappers if necessary
-        # Sometimes model.model.model is needed if using PEFT
-        if hasattr(current_model, 'model') and hasattr(current_model.model, 'model'):
-             # Case: Wrapper -> ForCausalLM -> Model
-             base_model = current_model.model.model
-        elif hasattr(current_model, 'model'):
-             # Case: Wrapper -> Model OR ForCausalLM -> Model
-             base_model = current_model.model
-        else:
-             # Case: Model directly
-             base_model = current_model
+        return None
 
-        print(f"\nDEBUG: Model structure detection")
-        print(f"  Initial model type: {type(self.model).__name__}")
-        print(f"  Base model type detected: {type(base_model).__name__}")
+    def _get_attention_module(self):
+        """Get the attention module for the specified layer using robust searching."""
+        
+        # Step 1: Unwrap standard wrappers
+        # Structure might be: Wrapper -> ForCausalLM -> Model -> (layers)
+        # Or: Wrapper -> Model -> (layers)
+        current = self.model
+        base_model = current
+        
+        # Try to unwrap .model repeatedly
+        while hasattr(current, 'model') and current.model is not None and current.model != current:
+            print(f"DEBUG: Unwrapping .model...")
+            base_model = current.model
+            current = current.model
 
-        layer_container = None
+        print(f"\nDEBUG: Searching for layers in {type(base_model).__name__}")
 
-        # 2. Try to find the layer container (layers, decoder, h, etc.)
-        if hasattr(base_model, 'layers'):
-            print(f"  ✓ Found base_model.layers (Standard Llama/Gemma style)")
-            layer_container = base_model.layers
-        elif hasattr(base_model, 'decoder'):
-            print(f"  ✓ Found base_model.decoder (Encoder-Decoder or Variant style)")
-            if hasattr(base_model.decoder, 'layers'):
-                layer_container = base_model.decoder.layers
-            else:
-                # Maybe decoder is the ModuleList itself (rare but possible)
-                layer_container = base_model.decoder
-        elif hasattr(base_model, 'transformer') and hasattr(base_model.transformer, 'h'):
-            print(f"  ✓ Found base_model.transformer.h (GPT style)")
-            layer_container = base_model.transformer.h
-        elif hasattr(base_model, 'h'):
-            print(f"  ✓ Found base_model.h (Direct GPT style)")
-            layer_container = base_model.h
-        else:
-            # Fallback: Try to find any ModuleList that looks like layers
-            print(f"  ✗ Standard attribute names not found.")
-            print(f"  Searching for ModuleList in children...")
-            for name, module in base_model.named_children():
-                if isinstance(module, torch.nn.ModuleList):
-                    print(f"  → Found candidate ModuleList: '{name}' with {len(module)} layers")
-                    # Heuristic: usually the layer container has many items
-                    if len(module) > 1: 
-                        layer_container = module
-                        break
+        # Step 2: Use heuristic search to find the container (layers list)
+        layer_container = self._find_layer_container_heuristic(base_model)
+
+        if layer_container is None:
+            # Fallback: Check if the base_model itself is the container (rare)
+            if isinstance(base_model, (torch.nn.ModuleList, torch.nn.Sequential)):
+                layer_container = base_model
+                print(f"  Heuristic: base_model itself is a ModuleList/Sequential")
         
         if layer_container is None:
-             raise ValueError(
-                f"Could not find layer container in {type(base_model).__name__}.\n"
-                f"Checked attributes: 'layers', 'decoder', 'transformer.h', 'h'.\n"
-                f"Model attributes: {[attr for attr in dir(base_model) if not attr.startswith('_')][:40]}"
+            # Last Resort: Print all named_children to help debug
+            print(f"  ERROR: Could not find layer container automatically.")
+            print(f"  Available named_children in base_model:")
+            for name, child in base_model.named_children():
+                print(f"    - {name} ({type(child).__name__})")
+                if isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    print(f"      ^^^ This looks like a list of layers! (Bug in heuristic?)")
+            
+            raise ValueError(
+                f"Could not automatically locate the layer container (ModuleList) in {type(base_model).__name__}.\n"
+                f"Please check the debug output above to see available children modules."
             )
 
-        # 3. Extract the specific layer
+        print(f"  ✓ Found layer container with {len(layer_container)} layers")
+
+        # Step 3: Extract the specific layer
         if self.layer_id >= len(layer_container):
             raise ValueError(f"Layer ID {self.layer_id} is out of bounds. Model has {len(layer_container)} layers.")
             
         layer = layer_container[self.layer_id]
+        print(f"  ✓ Extracted layer {self.layer_id} ({type(layer).__name__})")
 
-        # 4. Get attention module from the layer
+        # Step 4: Get attention module from the layer
         if hasattr(layer, 'self_attn'):
-            print(f"  ✓ Extracted layer {self.layer_id}, found 'self_attn'")
+            print(f"  ✓ Found 'self_attn'")
             return layer.self_attn
         elif hasattr(layer, 'attention'):
-            print(f"  ✓ Extracted layer {self.layer_id}, found 'attention'")
+            print(f"  ✓ Found 'attention'")
             return layer.attention
         else:
-            raise ValueError(f"Layer {self.layer_id} found, but it has no 'self_attn' or 'attention' module.")
+            # Debug layer internals if attention not found
+            print(f"  ERROR: Layer found but no 'self_attn' or 'attention' attribute.")
+            print(f"  Layer children: {list(layer.named_children())[:10]}")
+            raise ValueError(f"Layer {self.layer_id} does not have standard attention attributes.")
 
     def _get_projection(self, proj_name):
         """Get Q, K, or V projection module."""
         if hasattr(self.attn_module, proj_name):
             return getattr(self.attn_module, proj_name)
         else:
-            raise ValueError(f"Projection {proj_name} not found in attention module")
+            raise ValueError(f"Projection {proj_name} not found in attention module. Available: {list(self.attn_module.named_children())}")
 
     def register_hooks(self):
         """Register forward hooks to capture input activations."""
