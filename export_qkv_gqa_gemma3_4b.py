@@ -62,55 +62,68 @@ class GQAExtractor:
         # Get GQA configuration
         self.config = model.config
         
-        # --- ROBUST CONFIG READING (Fix for Gemma3Config or custom configs) ---
-        print("\nDEBUG: Analyzing Model Config attributes...")
-        print(f"Config type: {type(self.config).__name__}")
+        # --- ROBUST CONFIG READING (Handle Multimodal/Nested Configs like Gemma 3) ---
+        print("\nDEBUG: Analyzing Model Config structure...")
+        print(f"Root Config type: {type(self.config).__name__}")
         
-        # 1. Try to find hidden_size (common alternatives)
-        self.hidden_size = getattr(self.config, 'hidden_size', None)
-        if self.hidden_size is None:
-            self.hidden_size = getattr(self.config, 'd_model', None)
-        if self.hidden_size is None:
-             self.hidden_size = getattr(self.config, 'hidden', None)
+        # 1. Check for text_config (Multimodal models like Gemma 3)
+        eff_config = self.config
+        if hasattr(self.config, 'text_config') and self.config.text_config is not None:
+            print(f"  ✓ Detected 'text_config' attribute. Using it for dimensions.")
+            eff_config = self.config.text_config
+        elif hasattr(self.config, 'sub_configs') and 'text' in self.config.sub_configs:
+             print(f"  ✓ Detected 'sub_configs' dict. Using sub_configs['text'].")
+             eff_config = self.config.sub_configs['text']
+        else:
+            print(f"  ℹ No nested 'text_config' found, using root config.")
+            
+        print(f"Effective Config type: {type(eff_config).__name__}")
 
-        # If still not found, list all attributes to help debug
+        # 2. Try to find hidden_size (common alternatives)
+        self.hidden_size = getattr(eff_config, 'hidden_size', None)
         if self.hidden_size is None:
-            print("ERROR: Could not find 'hidden_size', 'd_model', or 'hidden' in config.")
-            print("Available config attributes (non-private, non-callable):")
-            for attr in dir(self.config):
-                if not attr.startswith('_') and not callable(getattr(self.config, attr)):
+            self.hidden_size = getattr(eff_config, 'd_model', None)
+        if self.hidden_size is None:
+             self.hidden_size = getattr(eff_config, 'hidden', None)
+
+        # If still not found, inspect the effective config attributes
+        if self.hidden_size is None:
+            print("ERROR: Could not find 'hidden_size', 'd_model', or 'hidden' in text_config.")
+            print("Available text_config attributes (non-private, non-callable):")
+            for attr in dir(eff_config):
+                if not attr.startswith('_') and not callable(getattr(eff_config, attr)):
                     print(f"  - {attr}")
             raise AttributeError("Cannot determine hidden size. Please check the attribute list above.")
 
-        # 2. Try to find num_heads
-        self.num_heads = getattr(self.config, 'num_attention_heads', 
-                                 getattr(self.config, 'num_query_heads', None))
+        # 3. Try to find num_heads
+        self.num_heads = getattr(eff_config, 'num_attention_heads', 
+                                 getattr(eff_config, 'num_query_heads', None))
         
         if self.num_heads is None:
-            print("ERROR: Could not find 'num_attention_heads' or 'num_query_heads'.")
+            print("ERROR: Could not find 'num_attention_heads' or 'num_query_heads' in text_config.")
             raise AttributeError("Cannot determine number of heads.")
 
-        # 3. Try to find num_kv_heads (for GQA)
-        self.num_key_value_heads = getattr(self.config, 'num_key_value_heads', 
-                                           getattr(self.config, 'num_kv_heads', None))
+        # 4. Try to find num_kv_heads (for GQA)
+        self.num_key_value_heads = getattr(eff_config, 'num_key_value_heads', 
+                                           getattr(eff_config, 'num_kv_heads', None))
         
         # Fallback to MHA if GQA not found in config
         if self.num_key_value_heads is None:
              self.num_key_value_heads = self.num_heads 
 
-        # 4. Try to find head_dim, otherwise calculate it
-        self.head_dim = getattr(self.config, 'head_dim', None)
+        # 5. Try to find head_dim, otherwise calculate it
+        self.head_dim = getattr(eff_config, 'head_dim', None)
         if self.head_dim is None:
             try:
                 self.head_dim = self.hidden_size // self.num_heads
-                print(f"  Info: 'head_dim' not in config, calculated as {self.head_dim} ({self.hidden_size}/{self.num_heads})")
+                print(f"  Info: 'head_dim' not in text_config, calculated as {self.head_dim} ({self.hidden_size}/{self.num_heads})")
             except Exception as e:
                 raise ValueError(f"Cannot determine head_dim. Error: {e}")
 
         # Calculate number of groups
         self.num_groups = self.num_heads // self.num_key_value_heads if self.num_key_value_heads else 1
 
-        print(f"\n=== Gemma 3 GQA Configuration (Detected) ===")
+        print(f"\n=== Gemma 3 GQA Configuration (Extracted) ===")
         print(f"Hidden size: {self.hidden_size}")
         print(f"Number of query heads: {self.num_heads}")
         print(f"Number of key/value heads: {self.num_key_value_heads}")
