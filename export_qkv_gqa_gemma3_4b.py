@@ -61,24 +61,62 @@ class GQAExtractor:
 
         # Get GQA configuration
         self.config = model.config
-        # Try different config attribute names used by different models
+        
+        # --- ROBUST CONFIG READING (Fix for Gemma3Config or custom configs) ---
+        print("\nDEBUG: Analyzing Model Config attributes...")
+        print(f"Config type: {type(self.config).__name__}")
+        
+        # 1. Try to find hidden_size (common alternatives)
+        self.hidden_size = getattr(self.config, 'hidden_size', None)
+        if self.hidden_size is None:
+            self.hidden_size = getattr(self.config, 'd_model', None)
+        if self.hidden_size is None:
+             self.hidden_size = getattr(self.config, 'hidden', None)
+
+        # If still not found, list all attributes to help debug
+        if self.hidden_size is None:
+            print("ERROR: Could not find 'hidden_size', 'd_model', or 'hidden' in config.")
+            print("Available config attributes (non-private, non-callable):")
+            for attr in dir(self.config):
+                if not attr.startswith('_') and not callable(getattr(self.config, attr)):
+                    print(f"  - {attr}")
+            raise AttributeError("Cannot determine hidden size. Please check the attribute list above.")
+
+        # 2. Try to find num_heads
         self.num_heads = getattr(self.config, 'num_attention_heads', 
                                  getattr(self.config, 'num_query_heads', None))
+        
+        if self.num_heads is None:
+            print("ERROR: Could not find 'num_attention_heads' or 'num_query_heads'.")
+            raise AttributeError("Cannot determine number of heads.")
+
+        # 3. Try to find num_kv_heads (for GQA)
         self.num_key_value_heads = getattr(self.config, 'num_key_value_heads', 
-                                           getattr(self.config, 'num_kv_heads', self.num_heads))
-        self.hidden_size = self.config.hidden_size
-        self.head_dim = getattr(self.config, 'head_dim', self.hidden_size // self.num_heads)
+                                           getattr(self.config, 'num_kv_heads', None))
+        
+        # Fallback to MHA if GQA not found in config
+        if self.num_key_value_heads is None:
+             self.num_key_value_heads = self.num_heads 
+
+        # 4. Try to find head_dim, otherwise calculate it
+        self.head_dim = getattr(self.config, 'head_dim', None)
+        if self.head_dim is None:
+            try:
+                self.head_dim = self.hidden_size // self.num_heads
+                print(f"  Info: 'head_dim' not in config, calculated as {self.head_dim} ({self.hidden_size}/{self.num_heads})")
+            except Exception as e:
+                raise ValueError(f"Cannot determine head_dim. Error: {e}")
 
         # Calculate number of groups
         self.num_groups = self.num_heads // self.num_key_value_heads if self.num_key_value_heads else 1
 
-        print(f"\n=== Gemma 3 GQA Configuration ===")
+        print(f"\n=== Gemma 3 GQA Configuration (Detected) ===")
         print(f"Hidden size: {self.hidden_size}")
         print(f"Number of query heads: {self.num_heads}")
         print(f"Number of key/value heads: {self.num_key_value_heads}")
         print(f"Head dimension: {self.head_dim}")
         print(f"Number of groups: {self.num_groups}")
-        print(f"===================================\n")
+        print(f"=============================================\n")
 
     def _find_layer_container_heuristic(self, module):
         """
