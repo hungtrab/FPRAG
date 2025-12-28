@@ -54,10 +54,18 @@ class JamesSteinGQAExporter:
 
         # Get GQA configuration
         self.config = model.config
-        self.num_heads = getattr(self.config, 'num_attention_heads', None)
-        self.num_key_value_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
+        # Try different config attribute names used by different models
+        self.num_heads = getattr(self.config, 'num_attention_heads', 
+                                 getattr(self.config, 'num_query_heads', None))
+        self.num_key_value_heads = getattr(self.config, 'num_key_value_heads',
+                                           getattr(self.config, 'num_kv_heads', self.num_heads))
         self.hidden_size = self.config.hidden_size
-        self.head_dim = self.hidden_size // self.num_heads
+        
+        # Compute head_dim from actual weight shapes (more reliable for models like Gemma-2)
+        # where head_dim may not equal hidden_size // num_heads
+        q_proj_out_features = self.q_proj.weight.shape[0]
+        self.head_dim = q_proj_out_features // self.num_heads
+        
         self.num_groups = self.num_heads // self.num_key_value_heads if self.num_key_value_heads else 1
 
         print(f"\n=== GQA Configuration ===")
@@ -82,7 +90,16 @@ class JamesSteinGQAExporter:
             base_model = self.model
 
         if hasattr(base_model, 'layers'):
-            return base_model.layers[self.layer_id].self_attn
+            # Llama-style architecture (Llama, Gemma, Mistral, etc.)
+            layer = base_model.layers[self.layer_id]
+            # Check for self_attn (most common)
+            if hasattr(layer, 'self_attn'):
+                return layer.self_attn
+            # Some models use 'attention' instead
+            elif hasattr(layer, 'attention'):
+                return layer.attention
+            else:
+                raise ValueError(f"Layer {self.layer_id} has no self_attn or attention module")
         elif hasattr(base_model, 'transformer') and hasattr(base_model.transformer, 'h'):
             return base_model.transformer.h[self.layer_id].attn
         else:
@@ -437,12 +454,21 @@ def main():
 
     # Load model
     print(f"\nLoading model: {args.model_path}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    except Exception as e:
+        print(f"Error loading model with bfloat16, trying float16: {e}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
     model.eval()
 
     # Load tokenizer
