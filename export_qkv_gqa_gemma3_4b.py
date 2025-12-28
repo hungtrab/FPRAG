@@ -82,48 +82,78 @@ class GQAExtractor:
 
     def _get_attention_module(self):
         """Get the attention module for the specified layer."""
-        # Try different model architectures
-        if hasattr(self.model, 'model'):
-            base_model = self.model.model
-        else:
-            base_model = self.model
-
-        # Debug: print available attributes
-        print(f"\nDEBUG: Model structure detection (Gemma 3)")
-        print(f"  has model.model: {hasattr(self.model, 'model')}")
-        if hasattr(self.model, 'model'):
-            print(f"  base_model type: {type(base_model).__name__}")
-            print(f"  base_model attributes: {[attr for attr in dir(base_model) if not attr.startswith('_')][:20]}")
+        # Handle different model wrappers (e.g., PeftModel wrapping a CausalLM)
+        current_model = self.model
         
-        if hasattr(base_model, 'layers'):
-            # Llama-style / Gemma-style architecture
-            print(f"  ✓ Found base_model.layers (Llama/Gemma-style)")
-            layer = base_model.layers[self.layer_id]
-            # Check for self_attn (most common for Llama/Gemma)
-            if hasattr(layer, 'self_attn'):
-                return layer.self_attn
-            # Some models use 'attention' instead
-            elif hasattr(layer, 'attention'):
-                return layer.attention
-            else:
-                raise ValueError(f"Layer {self.layer_id} has no self_attn or attention module")
-        elif hasattr(base_model, 'transformer') and hasattr(base_model.transformer, 'h'):
-            # GPT-style architecture
-            print(f"  ✓ Found base_model.transformer.h (GPT-style)")
-            return base_model.transformer.h[self.layer_id].attn
+        # 1. Try to unwrap PeftModel or similar wrappers if necessary
+        # Sometimes model.model.model is needed if using PEFT
+        if hasattr(current_model, 'model') and hasattr(current_model.model, 'model'):
+             # Case: Wrapper -> ForCausalLM -> Model
+             base_model = current_model.model.model
+        elif hasattr(current_model, 'model'):
+             # Case: Wrapper -> Model OR ForCausalLM -> Model
+             base_model = current_model.model
         else:
-            # Enhanced error message with debugging info
-            print(f"\n  ✗ Unknown architecture!")
-            print(f"  base_model type: {type(base_model).__name__}")
-            attrs = [attr for attr in dir(base_model) if not attr.startswith('_')]
-            print(f"  Available attributes: {attrs[:30]}")
-            
-            raise ValueError(
-                f"Unknown model architecture. Cannot find layer {self.layer_id}.\n"
-                f"Model type: {type(base_model).__name__}\n"
-                f"Available attributes: {attrs[:30]}\n"
-                f"Please report this model structure for support."
+             # Case: Model directly
+             base_model = current_model
+
+        print(f"\nDEBUG: Model structure detection")
+        print(f"  Initial model type: {type(self.model).__name__}")
+        print(f"  Base model type detected: {type(base_model).__name__}")
+
+        layer_container = None
+
+        # 2. Try to find the layer container (layers, decoder, h, etc.)
+        if hasattr(base_model, 'layers'):
+            print(f"  ✓ Found base_model.layers (Standard Llama/Gemma style)")
+            layer_container = base_model.layers
+        elif hasattr(base_model, 'decoder'):
+            print(f"  ✓ Found base_model.decoder (Encoder-Decoder or Variant style)")
+            if hasattr(base_model.decoder, 'layers'):
+                layer_container = base_model.decoder.layers
+            else:
+                # Maybe decoder is the ModuleList itself (rare but possible)
+                layer_container = base_model.decoder
+        elif hasattr(base_model, 'transformer') and hasattr(base_model.transformer, 'h'):
+            print(f"  ✓ Found base_model.transformer.h (GPT style)")
+            layer_container = base_model.transformer.h
+        elif hasattr(base_model, 'h'):
+            print(f"  ✓ Found base_model.h (Direct GPT style)")
+            layer_container = base_model.h
+        else:
+            # Fallback: Try to find any ModuleList that looks like layers
+            print(f"  ✗ Standard attribute names not found.")
+            print(f"  Searching for ModuleList in children...")
+            for name, module in base_model.named_children():
+                if isinstance(module, torch.nn.ModuleList):
+                    print(f"  → Found candidate ModuleList: '{name}' with {len(module)} layers")
+                    # Heuristic: usually the layer container has many items
+                    if len(module) > 1: 
+                        layer_container = module
+                        break
+        
+        if layer_container is None:
+             raise ValueError(
+                f"Could not find layer container in {type(base_model).__name__}.\n"
+                f"Checked attributes: 'layers', 'decoder', 'transformer.h', 'h'.\n"
+                f"Model attributes: {[attr for attr in dir(base_model) if not attr.startswith('_')][:40]}"
             )
+
+        # 3. Extract the specific layer
+        if self.layer_id >= len(layer_container):
+            raise ValueError(f"Layer ID {self.layer_id} is out of bounds. Model has {len(layer_container)} layers.")
+            
+        layer = layer_container[self.layer_id]
+
+        # 4. Get attention module from the layer
+        if hasattr(layer, 'self_attn'):
+            print(f"  ✓ Extracted layer {self.layer_id}, found 'self_attn'")
+            return layer.self_attn
+        elif hasattr(layer, 'attention'):
+            print(f"  ✓ Extracted layer {self.layer_id}, found 'attention'")
+            return layer.attention
+        else:
+            raise ValueError(f"Layer {self.layer_id} found, but it has no 'self_attn' or 'attention' module.")
 
     def _get_projection(self, proj_name):
         """Get Q, K, or V projection module."""
