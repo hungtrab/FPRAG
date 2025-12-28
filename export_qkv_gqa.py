@@ -87,8 +87,16 @@ class GQAExtractor:
         else:
             base_model = self.model
 
+        # Debug: print available attributes
+        print(f"\nDEBUG: Model structure detection")
+        print(f"  has model.model: {hasattr(self.model, 'model')}")
+        if hasattr(self.model, 'model'):
+            print(f"  base_model type: {type(base_model).__name__}")
+            print(f"  base_model attributes: {[attr for attr in dir(base_model) if not attr.startswith('_')][:20]}")
+        
         if hasattr(base_model, 'layers'):
             # Llama-style architecture (Llama, Gemma, Mistral, etc.)
+            print(f"  ✓ Found base_model.layers (Llama-style)")
             layer = base_model.layers[self.layer_id]
             # Check for self_attn (most common)
             if hasattr(layer, 'self_attn'):
@@ -100,9 +108,30 @@ class GQAExtractor:
                 raise ValueError(f"Layer {self.layer_id} has no self_attn or attention module")
         elif hasattr(base_model, 'transformer') and hasattr(base_model.transformer, 'h'):
             # GPT-style architecture
+            print(f"  ✓ Found base_model.transformer.h (GPT-style)")
             return base_model.transformer.h[self.layer_id].attn
         else:
-            raise ValueError(f"Unknown model architecture. Cannot find layer {self.layer_id}")
+            # Enhanced error message with debugging info
+            print(f"\n  ✗ Unknown architecture!")
+            print(f"  base_model type: {type(base_model).__name__}")
+            attrs = [attr for attr in dir(base_model) if not attr.startswith('_')]
+            print(f"  Available attributes: {attrs[:30]}")
+            
+            # Check for common layer containers
+            if hasattr(base_model, 'h'):
+                print(f"  → Found 'h' (might be GPT-style without transformer wrapper)")
+                return base_model.h[self.layer_id].attn
+            elif hasattr(base_model, 'decoder'):
+                print(f"  → Found 'decoder' (might be encoder-decoder)")
+                if hasattr(base_model.decoder, 'layers'):
+                    return base_model.decoder.layers[self.layer_id].self_attn
+            
+            raise ValueError(
+                f"Unknown model architecture. Cannot find layer {self.layer_id}.\n"
+                f"Model type: {type(base_model).__name__}\n"
+                f"Available attributes: {attrs[:30]}\n"
+                f"Please report this model structure for support."
+            )
 
     def _get_projection(self, proj_name):
         """Get Q, K, or V projection module."""
