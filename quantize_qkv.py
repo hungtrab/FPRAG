@@ -629,9 +629,13 @@ def main():
     print("  Strategy 1: Nearest rounding")
     print("  Strategy 2: Heuristic flip correction (from awq_js_xl.py)")
 
+    # Get actual number of heads from data shape
+    num_heads = Wq.shape[0]
+    print(f"\n  Detected {num_heads} query heads in this group")
+
     # Strategy 1: Nearest rounding
     print("\n  [2a] Quantizing with NEAREST rounding...")
-    print("    Quantizing Wq (4 heads)...")
+    print(f"    Quantizing Wq ({num_heads} heads)...")
     Wq_quant_nearest, Wq_scales_nearest, Wq_zp_nearest, Wq_int_nearest = \
         quantize_weight_groupwise_int4(Wq, group_size=128)
 
@@ -641,7 +645,7 @@ def main():
 
     # Strategy 2: Heuristic flip correction
     print("\n  [2b] Quantizing with HEURISTIC FLIP correction...")
-    print("    Quantizing Wq (4 heads)...")
+    print(f"    Quantizing Wq ({num_heads} heads)...")
     Wq_quant_flip, Wq_scales_flip, Wq_zp_flip, Wq_int_flip, Wq_flip_stats = \
         quantize_weight_groupwise_int4_with_flip(Wq, X, group_size=128)
 
@@ -664,9 +668,8 @@ def main():
     print("\n  [2c] Applying REFLIP correction (targeted critical dimensions)...")
 
     # Compute Q_orig and Q_heuristic for all heads (needed for ReFlip)
-    num_heads = Wq.shape[0]
-    Q_orig_all = np.zeros((num_heads, Wq.shape[1]))  # [4, 128]
-    Q_heuristic_all = np.zeros((num_heads, Wq.shape[1]))  # [4, 128]
+    Q_orig_all = np.zeros((num_heads, Wq.shape[1]))  # [num_heads, head_dim]
+    Q_heuristic_all = np.zeros((num_heads, Wq.shape[1]))  # [num_heads, head_dim]
 
     for head_idx in range(num_heads):
         Q_orig_all[head_idx] = X @ Wq[head_idx].T  # [4096] @ [128, 4096]^T = [128]
@@ -695,7 +698,7 @@ def main():
     # Compute weight quantization errors
     print("\n[3] Weight quantization errors:")
     print("\n  Strategy 1: NEAREST rounding")
-    for head_idx in range(4):
+    for head_idx in range(num_heads):
         err = compute_quantization_error(Wq[head_idx], Wq_quant_nearest[head_idx])
         print(f"    Wq head {head_idx}: MAE={err['mae']:.6f}, "
               f"Max={err['max_error']:.6f}, Rel={err['rel_error_pct']:.4f}%")
@@ -705,7 +708,7 @@ def main():
           f"Max={err_k_nearest['max_error']:.6f}, Rel={err_k_nearest['rel_error_pct']:.4f}%")
 
     print("\n  Strategy 2: HEURISTIC FLIP correction")
-    for head_idx in range(4):
+    for head_idx in range(num_heads):
         err = compute_quantization_error(Wq[head_idx], Wq_quant_flip[head_idx])
         print(f"    Wq head {head_idx}: MAE={err['mae']:.6f}, "
               f"Max={err['max_error']:.6f}, Rel={err['rel_error_pct']:.4f}%")
@@ -715,7 +718,7 @@ def main():
           f"Max={err_k_flip['max_error']:.6f}, Rel={err_k_flip['rel_error_pct']:.4f}%")
 
     print("\n  Strategy 3: REFLIP correction")
-    for head_idx in range(4):
+    for head_idx in range(num_heads):
         err = compute_quantization_error(Wq[head_idx], Wq_quant_reflip[head_idx])
         print(f"    Wq head {head_idx}: MAE={err['mae']:.6f}, "
               f"Max={err['max_error']:.6f}, Rel={err['rel_error_pct']:.4f}%")
@@ -728,7 +731,7 @@ def main():
     print("\n[4] Computing attention scores: (X @ Wq^T) · (X @ Wk^T)")
     print("="*70)
 
-    num_heads = 4
+    # num_heads already defined above from Wq.shape[0]
     results = []
 
     for head_idx in range(num_heads):
