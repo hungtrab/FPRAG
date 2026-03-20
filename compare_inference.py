@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import json
+import subprocess
 import time
 import gc
 import torch
@@ -158,6 +159,18 @@ def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
     return summary
 
 
+def nvidia_smi_vram_mb() -> float:
+    """Total GPU VRAM used across all processes via nvidia-smi (MiB)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        return float(out.strip().split("\n")[0])
+    except Exception:
+        return 0.0
+
+
 # ── vLLM inference benchmark ─────────────────────────────────────────────────
 
 def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
@@ -225,9 +238,9 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
                 f.write(config_backup)
     sampling = SamplingParams(temperature=0, max_tokens=n_tokens)
 
-    # Measure VRAM after load
-    torch.cuda.synchronize()
-    vram_load_mb = torch.cuda.memory_allocated() / 1024**2
+    # vLLM engine runs in a subprocess; torch.cuda.memory_allocated() only
+    # measures the main process. Use nvidia-smi for real GPU-wide VRAM.
+    vram_load_mb = nvidia_smi_vram_mb()
 
     # Warmup
     print(f"  Warmup ({n_warmup} runs)...")
@@ -240,17 +253,14 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
     vram_peak_mb = 0
 
     for prompt in prompts:
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         outputs = llm.generate([prompt], sampling)
 
-        torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
 
         n_new = len(outputs[0].outputs[0].token_ids)
-        peak = torch.cuda.max_memory_allocated() / 1024**2
+        peak = nvidia_smi_vram_mb()
         vram_peak_mb = max(vram_peak_mb, peak)
 
         results.append({
