@@ -225,7 +225,7 @@ python compare_awq_slicing.py \
 
 ## 6. So sánh inference speed (compare_inference.py)
 
-### 6a. Mistral-7B: FP16 vs FP16-dequant vs vLLM INT4
+### 6a. Mistral-7B: FP16 vs FP16-dequant vs vLLM INT4, batch size 1 và 16
 
 ```bash
 python compare_inference.py \
@@ -233,19 +233,37 @@ python compare_inference.py \
     --fp16dq-path ./quantized_models/mistral_awq_js \
     --vllm-path   ./quantized_models/mistral_awq_js_vllm \
     --vllm-quant  awq \
-    --n-tokens 128 \
-    --n-warmup 2
+    --n-tokens    128 \
+    --n-warmup    2 \
+    --batch-sizes 1,16
 ```
+
+> Nếu có model AWQ tải từ HuggingFace (vd: TheBloke/Mistral-7B-v0.3-AWQ):
+> ```bash
+> python compare_inference.py \
+>     --fp16-path   ./models/Mistral-7B-v0.3 \
+>     --hf-awq-path ./models/Mistral-7B-v0.3-AWQ \
+>     --vllm-path   ./quantized_models/mistral_awq_js_vllm \
+>     --vllm-quant  awq \
+>     --n-tokens    128 \
+>     --batch-sizes 1,16
+> ```
 
 ### 6b. Thử vLLM với Marlin kernel (nhanh hơn AWQ thường)
 
 ```bash
 python compare_inference.py \
-    --fp16-path  ./models/Mistral-7B-v0.3 \
-    --vllm-path  ./quantized_models/mistral_awq_js_vllm \
-    --vllm-quant awq_marlin \
-    --n-tokens 256
+    --fp16-path   ./models/Mistral-7B-v0.3 \
+    --vllm-path   ./quantized_models/mistral_awq_js_vllm \
+    --vllm-quant  awq_marlin \
+    --n-tokens    256 \
+    --batch-sizes 1,16
 ```
+
+> Nếu gặp lỗi PTX version mismatch, xem hướng dẫn fix:
+> ```bash
+> python compare_inference.py --help-marlin
+> ```
 
 ### 6c. Llama-3-8B inference
 
@@ -258,14 +276,15 @@ python compare_inference.py \
     --n-tokens 128
 ```
 
-### 6d. Dùng long prompts (test với input dài)
+### 6d. Dùng long prompts (test với input dài), batch size 1 và 16
 
 ```bash
 python compare_inference.py \
-    --fp16-path  ./models/Mistral-7B-v0.3 \
-    --vllm-path  ./quantized_models/mistral_awq_js_vllm \
+    --fp16-path   ./models/Mistral-7B-v0.3 \
+    --vllm-path   ./quantized_models/mistral_awq_js_vllm \
     --use-long \
-    --n-tokens 256
+    --n-tokens    256 \
+    --batch-sizes 1,16
 ```
 
 ---
