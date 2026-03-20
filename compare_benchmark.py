@@ -417,6 +417,7 @@ def main():
         results["roundtrip_check"] = errors
 
     # ── 4. vLLM PPL check ─────────────────────────────────────────────────────
+    # Dùng vLLM generate() để tính PPL thay vì load HF (vLLM format không tương thích HF)
     if args.vllm_path and args.check in ("all", "sanity"):
         print("\n" + "="*70)
         print(f"[vLLM AWQ INT4] {args.vllm_path}")
@@ -424,34 +425,91 @@ def main():
 
         try:
             from vllm import LLM, SamplingParams
-
-            llm = LLM(model=args.vllm_path, quantization="awq", dtype="float16")
-
-            # vLLM không support PPL trực tiếp → dùng HF loader với quantization="awq"
-            print("  Note: Loading via HuggingFace for PPL (not vLLM engine)")
-            del llm
-            torch.cuda.empty_cache()
-
-            model, tokenizer = load_model_hf(args.vllm_path, device)
-            text = load_wikitext2(max_chars)
-            ppl_vllm = ppl_sliding_window(model, tokenizer, text, args.max_length, args.stride, device)
-            print(f"  vLLM AWQ PPL (WikiText-2): {ppl_vllm:.4f}")
-
-            if "fp16dq_check" in results:
-                base = results["fp16dq_check"]["ppl_wikitext2"]
-                diff = (ppl_vllm - base) / base * 100
-                print(f"  vs FP16-dequant: {diff:+.2f}%")
-                if abs(diff) < 0.5:
-                    print("  ✅ PPL consistent — conversion correct")
-                else:
-                    print("  ⚠️  PPL differs from FP16-dequant — check group_size or pack order")
-
-            results["vllm_check"] = {"ppl_wikitext2": ppl_vllm}
-            del model
-            torch.cuda.empty_cache()
-
         except ImportError:
             print("  ❌ vLLM not installed, skipping vLLM check")
+        else:
+            try:
+                llm = LLM(model=args.vllm_path, quantization="awq", dtype="float16")
+                tokenizer_vllm = AutoTokenizer.from_pretrained(
+                    args.vllm_path, trust_remote_code=True, use_fast=True
+                )
+
+                text = load_wikitext2(max_chars)
+                # Tokenize và chia thành chunks để tính PPL qua vLLM logprobs
+                encodings = tokenizer_vllm(
+                    text[:50000], return_tensors="pt", add_special_tokens=False
+                )
+                input_ids = encodings.input_ids[0].tolist()
+
+                chunk_size = args.max_length - 1
+                stride = args.stride
+                nlls = []
+                total_tokens = 0
+
+                print(f"  Computing PPL via vLLM logprobs (stride={stride})...")
+                prev_end = 0
+                for begin in range(0, len(input_ids), stride):
+                    end = min(begin + chunk_size, len(input_ids))
+                    trg_len = end - prev_end
+                    chunk = input_ids[begin:end]
+                    if len(chunk) < 2:
+                        break
+
+                    prompt_ids = chunk[:-1]
+                    target_ids = chunk[1:]
+
+                    sp = SamplingParams(
+                        temperature=0, max_tokens=1,
+                        prompt_logprobs=len(prompt_ids),
+                    )
+                    out = llm.generate(
+                        prompt_token_ids=[prompt_ids], sampling_params=sp
+                    )
+                    logprobs_list = out[0].prompt_logprobs  # list of dicts
+
+                    # logprobs_list[i] = {token_id: Logprob} or None for first token
+                    nll = 0.0
+                    scored = 0
+                    start_score = max(0, len(chunk) - 1 - trg_len)
+                    for i in range(start_score, len(target_ids)):
+                        lp_dict = logprobs_list[i + 1] if (i + 1) < len(logprobs_list) else None
+                        if lp_dict and target_ids[i] in lp_dict:
+                            nll -= lp_dict[target_ids[i]].logprob
+                            scored += 1
+
+                    if scored > 0:
+                        nlls.append(nll)
+                        total_tokens += scored
+
+                    prev_end = end
+                    if end == len(input_ids):
+                        break
+
+                if total_tokens > 0:
+                    import math
+                    ppl_vllm = math.exp(sum(nlls) / total_tokens)
+                    print(f"  vLLM AWQ PPL (WikiText-2 subset): {ppl_vllm:.4f}")
+
+                    if "fp16dq_check" in results:
+                        base = results["fp16dq_check"]["ppl_wikitext2"]
+                        diff = (ppl_vllm - base) / base * 100
+                        print(f"  vs FP16-dequant: {diff:+.2f}%")
+                        if abs(diff) < 1.0:
+                            print("  ✅ PPL consistent — conversion correct")
+                        else:
+                            print("  ⚠️  PPL differs — check group_size or pack order")
+
+                    results["vllm_check"] = {"ppl_wikitext2": ppl_vllm}
+                else:
+                    print("  ⚠️  Could not compute vLLM PPL (no logprobs)")
+
+                del llm
+                torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"  ❌ vLLM PPL check failed: {e}")
+                import traceback
+                traceback.print_exc()
 
     # ── Final summary ─────────────────────────────────────────────────────────
     print("\n" + "="*70)
