@@ -2,33 +2,31 @@
 compare_inference.py
 
 So sánh tốc độ inference giữa:
-  1. FP16 baseline (model gốc)
-  2. Custom AWQ FP16 dequantized (output của awq_stand_xl / awq_js_xl)
-  3. vLLM AWQ INT4 (output của convert_custom_awq_to_vllm.py)
+  1. FP16 baseline (model gốc, HuggingFace)
+  2. Custom AWQ FP16 dequantized (output của awq_stand_xl / awq_js_xl, HuggingFace)
+  3. HF AWQ INT4 (model AWQ tải từ HuggingFace, dùng vLLM)
+  4. Custom AWQ INT4 (output của convert_custom_awq_to_vllm.py, dùng vLLM)
 
-Metrics:
-  - Throughput: tokens/sec
-  - Latency: time-to-first-token, avg token latency
-  - Memory: peak GPU VRAM (MB)
+Hỗ trợ test batch size: --batch-sizes 1,16
 
 Usage:
-  # So sánh tất cả
-  python compare_inference.py \
-      --fp16-path   ./models/Mistral-7B-v0.3 \
-      --fp16dq-path ./quantized_models/model_awq_js_xl \
-      --vllm-path   ./quantized_models/model_awq_js_xl_vllm
+  # So sánh đầy đủ với 2 batch sizes
+  python compare_inference.py \\
+      --fp16-path    ./models/Mistral-7B-v0.3 \\
+      --fp16dq-path  ./quantized_models/mistral_awq_js \\
+      --hf-awq-path  ./models/Mistral-7B-v0.3-AWQ \\
+      --vllm-path    ./quantized_models/mistral_awq_js_vllm \\
+      --batch-sizes  1,16
 
-  # Chỉ so sánh FP16 vs vLLM
-  python compare_inference.py \
-      --fp16-path  ./models/Mistral-7B-v0.3 \
-      --vllm-path  ./quantized_models/model_awq_js_xl_vllm
-
-  # Chỉ test vLLM
-  python compare_inference.py --vllm-path ./quantized_models/model_awq_js_xl_vllm
+  # Chỉ vLLM, batch sizes 1 và 8
+  python compare_inference.py \\
+      --vllm-path ./quantized_models/mistral_awq_js_vllm \\
+      --batch-sizes 1,8
 """
 
 import argparse
 import json
+import math
 import subprocess
 import time
 import gc
@@ -54,96 +52,117 @@ LONG_PROMPTS = [
 ]
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def make_batch(prompts: list, batch_size: int) -> list:
+    """Tile prompts to exactly batch_size entries."""
+    return (prompts * math.ceil(batch_size / len(prompts)))[:batch_size]
+
+
+def nvidia_smi_vram_mb() -> float:
+    """Total GPU VRAM used across all processes via nvidia-smi (MiB)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        return float(out.strip().split("\n")[0])
+    except Exception:
+        return 0.0
+
+
 # ── HuggingFace inference benchmark ──────────────────────────────────────────
 
 def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
-                 n_warmup: int, quantization=None):
+                 n_warmup: int, batch_size: int = 1):
     """
     Benchmark HuggingFace model (FP16 hoặc FP16-dequantized).
-    Returns dict với throughput, latency, memory stats.
+    Hỗ trợ batch_size > 1 với left-padding.
     """
     print(f"\n{'='*60}")
-    print(f"  Benchmarking: {label}")
+    print(f"  Benchmarking: {label}  [bs={batch_size}]")
     print(f"  Path: {model_path}")
     print(f"{'='*60}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Left-padding required for batched causal LM generation
+    tokenizer.padding_side = "left"
 
-    # Load model
-    load_kwargs = dict(
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
         dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
     )
-    model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
     model.eval()
 
-    # Measure VRAM after load
     torch.cuda.synchronize()
     vram_load_mb = torch.cuda.memory_allocated() / 1024**2
 
-    results = []
-
     # Warmup
     print(f"  Warmup ({n_warmup} runs)...")
-    for i in range(n_warmup):
-        prompt = prompts[i % len(prompts)]
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    warmup_batch = make_batch(prompts, min(batch_size, 2))
+    for _ in range(n_warmup):
+        inp = tokenizer(warmup_batch, return_tensors="pt", padding=True,
+                        truncation=True, max_length=512).to(device)
         with torch.no_grad():
-            model.generate(**inputs, max_new_tokens=32, do_sample=False)
+            model.generate(**inp, max_new_tokens=16, do_sample=False)
     torch.cuda.synchronize()
 
     # Benchmark
-    print(f"  Benchmark ({len(prompts)} prompts × {n_tokens} tokens)...")
+    # bs=1: run over each prompt individually (variance across prompts)
+    # bs>1: tile prompts to batch_size, run 5 rounds
+    if batch_size == 1:
+        bench_batches = [[p] for p in prompts]
+    else:
+        b = make_batch(prompts, batch_size)
+        bench_batches = [b] * 5
+
+    print(f"  Benchmark ({len(bench_batches)} runs × bs={batch_size} × {n_tokens} tokens)...")
+    results = []
     vram_peak_mb = 0
 
-    for prompt in prompts:
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        input_len = inputs["input_ids"].shape[1]
+    for batch in bench_batches:
+        inp = tokenizer(batch, return_tensors="pt", padding=True,
+                        truncation=True, max_length=512).to(device)
+        input_len = inp["input_ids"].shape[1]
 
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                max_new_tokens=n_tokens,
-                do_sample=False,
-                use_cache=True,
-            )
+            out = model.generate(**inp, max_new_tokens=n_tokens,
+                                 do_sample=False, use_cache=True)
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
 
-        n_new = output.shape[1] - input_len
+        n_new_total = (out.shape[1] - input_len) * len(batch)
         peak = torch.cuda.max_memory_allocated() / 1024**2
         vram_peak_mb = max(vram_peak_mb, peak)
 
         results.append({
             "elapsed": elapsed,
-            "n_tokens": n_new,
-            "tokens_per_sec": n_new / elapsed,
-            "latency_ms_per_token": elapsed / n_new * 1000,
+            "total_tokens": n_new_total,
+            "throughput": n_new_total / elapsed,
+            "latency_ms_per_token": elapsed / (out.shape[1] - input_len) * 1000,
         })
 
-    # Summary
-    tps_list = [r["tokens_per_sec"] for r in results]
+    tps_list = [r["throughput"] for r in results]
     lat_list = [r["latency_ms_per_token"] for r in results]
 
     summary = {
         "label": label,
+        "batch_size": batch_size,
         "vram_load_mb": vram_load_mb,
         "vram_peak_mb": vram_peak_mb,
         "throughput_mean": np.mean(tps_list),
         "throughput_std":  np.std(tps_list),
-        "throughput_min":  np.min(tps_list),
-        "throughput_max":  np.max(tps_list),
         "latency_mean_ms": np.mean(lat_list),
         "latency_std_ms":  np.std(lat_list),
     }
@@ -159,29 +178,18 @@ def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
     return summary
 
 
-def nvidia_smi_vram_mb() -> float:
-    """Total GPU VRAM used across all processes via nvidia-smi (MiB)."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            text=True,
-        )
-        return float(out.strip().split("\n")[0])
-    except Exception:
-        return 0.0
-
-
 # ── vLLM inference benchmark ─────────────────────────────────────────────────
 
 def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
                    n_warmup: int, quantization: str = "awq",
-                   gpu_memory_utilization: float = 0.8):
+                   gpu_memory_utilization: float = 0.8,
+                   batch_size: int = 1):
     """
-    Benchmark vLLM model (AWQ INT4).
-    Requires: pip install vllm
+    Benchmark vLLM model.
+    Hỗ trợ batch_size > 1: gửi cả batch vào llm.generate() cùng lúc.
     """
     print(f"\n{'='*60}")
-    print(f"  Benchmarking (vLLM): {label}")
+    print(f"  Benchmarking (vLLM): {label}  [bs={batch_size}]")
     print(f"  Path: {model_path}")
     print(f"  Quantization: {quantization}")
     print(f"{'='*60}")
@@ -204,7 +212,6 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
             qc = config_data["quantization_config"]
             qc["quant_method"] = "awq_marlin"
             qc["version"] = "marlin"
-            # awq_marlin schema requires "bits" and "group_size" (not "w_bit"/"q_group_size")
             if "bits" not in qc:
                 qc["bits"] = qc.get("w_bit", 4)
             if "group_size" not in qc:
@@ -223,12 +230,12 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
         is_ptx_error = (
             "PTX" in err or "unsupported toolchain" in err
             or "cudaErrorUnsupportedPtxVersion" in err
-            # Marlin PTX error surfaces via subprocess as generic init failure
             or (quantization == "awq_marlin" and "Engine core initialization failed" in err)
         )
         if is_ptx_error:
-            print(f"  ⚠️  awq_marlin not supported on this CUDA driver (PTX version mismatch).")
-            print(f"     Use --vllm-quant awq instead.")
+            print(f"  ⚠️  awq_marlin: PTX version mismatch (CUDA driver too old).")
+            print(f"     Fix: upgrade NVIDIA driver hoặc compile vLLM từ source.")
+            print(f"     Xem hướng dẫn: python compare_inference.py --help-marlin")
         else:
             print(f"  ❌ vLLM load failed: {e}")
         return None
@@ -236,51 +243,56 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
         if config_backup is not None:
             with open(config_path, "w") as f:
                 f.write(config_backup)
+
     sampling = SamplingParams(temperature=0, max_tokens=n_tokens)
 
-    # vLLM engine runs in a subprocess; torch.cuda.memory_allocated() only
-    # measures the main process. Use nvidia-smi for real GPU-wide VRAM.
+    # vLLM engine runs in a subprocess; use nvidia-smi for real VRAM.
     vram_load_mb = nvidia_smi_vram_mb()
 
     # Warmup
     print(f"  Warmup ({n_warmup} runs)...")
-    for i in range(n_warmup):
-        llm.generate([prompts[i % len(prompts)]], SamplingParams(temperature=0, max_tokens=32))
+    warmup_batch = make_batch(prompts, min(batch_size, 2))
+    for _ in range(n_warmup):
+        llm.generate(warmup_batch, SamplingParams(temperature=0, max_tokens=16))
 
     # Benchmark
-    print(f"  Benchmark ({len(prompts)} prompts × {n_tokens} tokens)...")
+    if batch_size == 1:
+        bench_batches = [[p] for p in prompts]
+    else:
+        b = make_batch(prompts, batch_size)
+        bench_batches = [b] * 5
+
+    print(f"  Benchmark ({len(bench_batches)} runs × bs={batch_size} × {n_tokens} tokens)...")
     results = []
     vram_peak_mb = 0
 
-    for prompt in prompts:
+    for batch in bench_batches:
         t0 = time.perf_counter()
-
-        outputs = llm.generate([prompt], sampling)
-
+        outputs = llm.generate(batch, sampling)
         elapsed = time.perf_counter() - t0
 
-        n_new = len(outputs[0].outputs[0].token_ids)
+        n_new_total = sum(len(o.outputs[0].token_ids) for o in outputs)
+        avg_per_seq = n_new_total / len(batch)
         peak = nvidia_smi_vram_mb()
         vram_peak_mb = max(vram_peak_mb, peak)
 
         results.append({
             "elapsed": elapsed,
-            "n_tokens": n_new,
-            "tokens_per_sec": n_new / elapsed,
-            "latency_ms_per_token": elapsed / n_new * 1000,
+            "total_tokens": n_new_total,
+            "throughput": n_new_total / elapsed,
+            "latency_ms_per_token": elapsed / avg_per_seq * 1000,
         })
 
-    tps_list = [r["tokens_per_sec"] for r in results]
+    tps_list = [r["throughput"] for r in results]
     lat_list = [r["latency_ms_per_token"] for r in results]
 
     summary = {
         "label": label,
+        "batch_size": batch_size,
         "vram_load_mb": vram_load_mb,
         "vram_peak_mb": vram_peak_mb,
         "throughput_mean": np.mean(tps_list),
         "throughput_std":  np.std(tps_list),
-        "throughput_min":  np.min(tps_list),
-        "throughput_max":  np.max(tps_list),
         "latency_mean_ms": np.mean(lat_list),
         "latency_std_ms":  np.std(lat_list),
     }
@@ -304,95 +316,181 @@ def print_table(summaries: list, baseline_label: str = None):
         print("No results to display.")
         return
 
-    print("\n" + "=" * 90)
-    print("INFERENCE SPEED COMPARISON")
-    print("=" * 90)
-    print(f"{'Model':<30} {'VRAM Load':>10} {'VRAM Peak':>10} {'Throughput':>14} {'Latency':>14} {'Speedup':>8}")
-    print(f"{'':30} {'(MB)':>10} {'(MB)':>10} {'(tok/s)':>14} {'(ms/tok)':>14} {'vs base':>8}")
-    print("-" * 90)
+    # Group by batch_size for display
+    batch_sizes = sorted(set(s["batch_size"] for s in valid))
 
-    # Find baseline throughput
-    baseline_tps = None
-    if baseline_label:
-        for s in valid:
-            if s["label"] == baseline_label:
-                baseline_tps = s["throughput_mean"]
-                break
-    if baseline_tps is None and valid:
-        baseline_tps = valid[0]["throughput_mean"]
+    for bs in batch_sizes:
+        group = [s for s in valid if s["batch_size"] == bs]
 
-    for s in valid:
-        speedup = s["throughput_mean"] / baseline_tps if baseline_tps else 1.0
-        speedup_str = f"{speedup:.2f}x"
-        tps_str = f"{s['throughput_mean']:.1f} ±{s['throughput_std']:.1f}"
-        lat_str = f"{s['latency_mean_ms']:.2f} ±{s['latency_std_ms']:.2f}"
-        print(f"  {s['label']:<28} {s['vram_load_mb']:>10.0f} {s['vram_peak_mb']:>10.0f} "
-              f"{tps_str:>14} {lat_str:>14} {speedup_str:>8}")
+        # Find baseline tps for this group
+        baseline_tps = None
+        if baseline_label:
+            for s in group:
+                if s["label"] == baseline_label:
+                    baseline_tps = s["throughput_mean"]
+                    break
+        if baseline_tps is None and group:
+            baseline_tps = group[0]["throughput_mean"]
 
-    print("=" * 90)
+        W = 100
+        print(f"\n{'='*W}")
+        print(f"  INFERENCE SPEED COMPARISON  [Batch Size = {bs}]")
+        print(f"{'='*W}")
+        print(f"  {'Model':<32} {'VRAM Load':>10} {'VRAM Peak':>10} {'Throughput':>16} {'Latency':>16} {'Speedup':>8}")
+        print(f"  {'':32} {'(MB)':>10} {'(MB)':>10} {'(tok/s)':>16} {'(ms/tok)':>16} {'vs base':>8}")
+        print(f"  {'-'*96}")
 
-    # VRAM savings
-    if len(valid) >= 2:
-        print("\nVRAM Savings (load):")
-        base_vram = valid[0]["vram_load_mb"]
-        for s in valid[1:]:
-            saving_pct = (base_vram - s["vram_load_mb"]) / base_vram * 100
-            print(f"  {s['label']} vs {valid[0]['label']}: {saving_pct:+.1f}% "
-                  f"({base_vram:.0f} → {s['vram_load_mb']:.0f} MB)")
+        for s in group:
+            speedup = s["throughput_mean"] / baseline_tps if baseline_tps else 1.0
+            tps_str = f"{s['throughput_mean']:.1f} ±{s['throughput_std']:.1f}"
+            lat_str = f"{s['latency_mean_ms']:.2f} ±{s['latency_std_ms']:.2f}"
+            print(f"  {s['label']:<32} {s['vram_load_mb']:>10.0f} {s['vram_peak_mb']:>10.0f}"
+                  f" {tps_str:>16} {lat_str:>16} {speedup:>7.2f}x")
+
+        print(f"{'='*W}")
+
+    # VRAM savings across all (use first batch_size group)
+    first_bs = batch_sizes[0]
+    group0 = [s for s in valid if s["batch_size"] == first_bs]
+    if len(group0) >= 2:
+        print(f"\nVRAM Savings (load, bs={first_bs}):")
+        base_vram = group0[0]["vram_load_mb"]
+        for s in group0[1:]:
+            if base_vram > 0:
+                pct = (base_vram - s["vram_load_mb"]) / base_vram * 100
+                print(f"  {s['label']} vs {group0[0]['label']}: {pct:+.1f}%"
+                      f"  ({base_vram:.0f} → {s['vram_load_mb']:.0f} MB)")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def print_marlin_help():
+    print("""
+awq_marlin PTX Fix Guide
+========================
+
+Lỗi: CUDA error: the provided PTX was compiled with an unsupported toolchain
+Nguyên nhân: vLLM 0.17 compile Marlin kernels cho CUDA 12.4+,
+             nhưng NVIDIA driver trên server quá cũ.
+
+Cách kiểm tra:
+  nvidia-smi                          # xem "CUDA Version: X.Y" góc phải
+  python -c "import torch; print(torch.version.cuda)"  # CUDA của PyTorch
+
+Cách fix (chọn 1):
+
+1. Nâng cấp NVIDIA driver (cần sudo/root):
+   # Ubuntu
+   sudo apt install nvidia-driver-535   # hoặc mới hơn
+   sudo reboot
+
+2. Compile vLLM từ source cho đúng CUDA:
+   pip uninstall vllm -y
+   git clone https://github.com/vllm-project/vllm
+   cd vllm
+   # Đảm bảo CUDA toolkit khớp driver
+   pip install -e . --no-build-isolation
+
+3. Dùng vLLM nightly wheel cho CUDA cũ hơn:
+   pip install vllm --pre --index-url https://wheels.vllm.ai/nightly/
+
+Nếu không fix được, dùng --vllm-quant awq (không dùng Marlin).
+AWQ thường vẫn nhanh hơn FP16 đáng kể (~2-3x với batching).
+""")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare inference speed: FP16 vs AWQ-dequant vs vLLM-AWQ",
+        description="Compare inference speed: FP16 vs AWQ-dequant vs HF-AWQ vs vLLM-AWQ",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--fp16-path",   type=str, default="", help="FP16 baseline model path")
-    parser.add_argument("--fp16dq-path", type=str, default="", help="FP16 dequantized AWQ model path (awq_js_xl output)")
-    parser.add_argument("--vllm-path",   type=str, default="", help="vLLM AWQ INT4 model path (convert_custom_awq_to_vllm output)")
-    parser.add_argument("--vllm-quant",  type=str, default="awq", choices=["awq", "awq_marlin"],
-                        help="vLLM quantization backend")
-    parser.add_argument("--n-tokens",    type=int, default=128, help="Tokens to generate per prompt")
-    parser.add_argument("--n-warmup",    type=int, default=2,   help="Warmup runs before timing")
-    parser.add_argument("--use-long",    action="store_true",   help="Use long prompts instead of short")
-    parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="vLLM gpu_memory_utilization (default: 0.8)")
+    parser.add_argument("--fp16-path",    type=str, default="",
+                        help="FP16 baseline model path (HuggingFace format)")
+    parser.add_argument("--fp16dq-path",  type=str, default="",
+                        help="FP16 dequantized AWQ model path (awq_js_xl output)")
+    parser.add_argument("--hf-awq-path",  type=str, default="",
+                        help="AWQ INT4 model từ HuggingFace (vd: ./models/Mistral-7B-AWQ), load bằng vLLM")
+    parser.add_argument("--vllm-path",    type=str, default="",
+                        help="Custom vLLM AWQ checkpoint (convert_custom_awq_to_vllm output)")
+    parser.add_argument("--vllm-quant",   type=str, default="awq",
+                        choices=["awq", "awq_marlin"],
+                        help="vLLM quantization backend cho --vllm-path")
+    parser.add_argument("--n-tokens",     type=int, default=128,
+                        help="Tokens to generate per sequence")
+    parser.add_argument("--n-warmup",     type=int, default=2,
+                        help="Warmup runs before timing")
+    parser.add_argument("--use-long",     action="store_true",
+                        help="Use long prompts instead of short")
+    parser.add_argument("--batch-sizes",  type=str, default="1",
+                        help="Batch sizes to test, comma-separated (vd: '1,16')")
+    parser.add_argument("--gpu-mem-util", type=float, default=0.8,
+                        help="vLLM gpu_memory_utilization")
+    parser.add_argument("--help-marlin",  action="store_true",
+                        help="Show guide to fix awq_marlin PTX error")
     args = parser.parse_args()
 
-    if not any([args.fp16_path, args.fp16dq_path, args.vllm_path]):
-        parser.error("Provide at least one of --fp16-path, --fp16dq-path, --vllm-path")
+    if args.help_marlin:
+        print_marlin_help()
+        return
 
+    if not any([args.fp16_path, args.fp16dq_path, args.hf_awq_path, args.vllm_path]):
+        parser.error("Provide at least one of --fp16-path, --fp16dq-path, --hf-awq-path, --vllm-path")
+
+    batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",")]
     prompts = LONG_PROMPTS if args.use_long else SHORT_PROMPTS
 
     print("=" * 90)
     print("INFERENCE SPEED BENCHMARK")
     print("=" * 90)
-    print(f"Prompts    : {len(prompts)} ({'long' if args.use_long else 'short'})")
-    print(f"New tokens : {args.n_tokens}")
-    print(f"Warmup     : {args.n_warmup}")
+    print(f"Prompts     : {len(prompts)} ({'long' if args.use_long else 'short'})")
+    print(f"New tokens  : {args.n_tokens}")
+    print(f"Warmup      : {args.n_warmup}")
+    print(f"Batch sizes : {batch_sizes}")
     print("=" * 90)
 
     summaries = []
     baseline_label = None
 
-    if args.fp16_path:
-        s = benchmark_hf(args.fp16_path, "FP16 Baseline", prompts, args.n_tokens, args.n_warmup)
-        summaries.append(s)
-        baseline_label = "FP16 Baseline"
+    for bs in batch_sizes:
+        print(f"\n{'#'*60}")
+        print(f"#  Batch Size = {bs}")
+        print(f"{'#'*60}")
 
-    if args.fp16dq_path:
-        s = benchmark_hf(args.fp16dq_path, "AWQ FP16-dequant (HF)", prompts, args.n_tokens, args.n_warmup)
-        summaries.append(s)
-        if baseline_label is None:
-            baseline_label = "AWQ FP16-dequant (HF)"
+        if args.fp16_path:
+            s = benchmark_hf(args.fp16_path, "FP16 Baseline", prompts,
+                             args.n_tokens, args.n_warmup, batch_size=bs)
+            summaries.append(s)
+            if baseline_label is None:
+                baseline_label = "FP16 Baseline"
 
-    if args.vllm_path:
-        s = benchmark_vllm(args.vllm_path, f"vLLM AWQ INT4 ({args.vllm_quant})",
-                           prompts, args.n_tokens, args.n_warmup, args.vllm_quant,
-                           gpu_memory_utilization=args.gpu_mem_util)
-        summaries.append(s)
-        if baseline_label is None:
-            baseline_label = f"vLLM AWQ INT4 ({args.vllm_quant})"
+        if args.fp16dq_path:
+            s = benchmark_hf(args.fp16dq_path, "AWQ FP16-dequant (HF)", prompts,
+                             args.n_tokens, args.n_warmup, batch_size=bs)
+            summaries.append(s)
+            if baseline_label is None:
+                baseline_label = "AWQ FP16-dequant (HF)"
+
+        if args.hf_awq_path:
+            # HuggingFace AWQ model loaded via vLLM (quant already set in config.json)
+            s = benchmark_vllm(args.hf_awq_path, "HF AWQ INT4 (vLLM)", prompts,
+                               args.n_tokens, args.n_warmup,
+                               quantization="awq",
+                               gpu_memory_utilization=args.gpu_mem_util,
+                               batch_size=bs)
+            summaries.append(s)
+            if baseline_label is None:
+                baseline_label = "HF AWQ INT4 (vLLM)"
+
+        if args.vllm_path:
+            label = f"Custom AWQ INT4 ({args.vllm_quant})"
+            s = benchmark_vllm(args.vllm_path, label, prompts,
+                               args.n_tokens, args.n_warmup,
+                               quantization=args.vllm_quant,
+                               gpu_memory_utilization=args.gpu_mem_util,
+                               batch_size=bs)
+            summaries.append(s)
+            if baseline_label is None:
+                baseline_label = label
 
     print_table(summaries, baseline_label)
 
