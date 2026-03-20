@@ -188,8 +188,14 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
             config_data = json.load(f)
         config_backup = json.dumps(config_data, indent=2)
         if "quantization_config" in config_data:
-            config_data["quantization_config"]["quant_method"] = "awq_marlin"
-            config_data["quantization_config"]["version"] = "marlin"
+            qc = config_data["quantization_config"]
+            qc["quant_method"] = "awq_marlin"
+            qc["version"] = "marlin"
+            # awq_marlin schema requires "bits" and "group_size" (not "w_bit"/"q_group_size")
+            if "bits" not in qc:
+                qc["bits"] = qc.get("w_bit", 4)
+            if "group_size" not in qc:
+                qc["group_size"] = qc.get("q_group_size", 128)
         with open(config_path, "w") as f:
             json.dump(config_data, f, indent=2)
 
