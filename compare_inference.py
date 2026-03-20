@@ -207,7 +207,13 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
             with open(config_path, "w") as f:
                 f.write(config_backup)
         err = str(e)
-        if "PTX" in err or "unsupported toolchain" in err or "cudaErrorUnsupportedPtxVersion" in err:
+        is_ptx_error = (
+            "PTX" in err or "unsupported toolchain" in err
+            or "cudaErrorUnsupportedPtxVersion" in err
+            # Marlin PTX error surfaces via subprocess as generic init failure
+            or (quantization == "awq_marlin" and "Engine core initialization failed" in err)
+        )
+        if is_ptx_error:
             print(f"  ⚠️  awq_marlin not supported on this CUDA driver (PTX version mismatch).")
             print(f"     Use --vllm-quant awq instead.")
         else:
