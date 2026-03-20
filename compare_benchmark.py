@@ -462,8 +462,9 @@ def main():
                         temperature=0, max_tokens=1,
                         prompt_logprobs=len(prompt_ids),
                     )
+                    # vLLM >= 0.4: pass token IDs via dict, not kwarg
                     out = llm.generate(
-                        prompt_token_ids=[prompt_ids], sampling_params=sp
+                        [{"prompt_token_ids": prompt_ids}], sampling_params=sp
                     )
                     logprobs_list = out[0].prompt_logprobs  # list of dicts
 
