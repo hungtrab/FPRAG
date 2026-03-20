@@ -73,7 +73,7 @@ def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
 
     # Load model
     load_kwargs = dict(
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -159,7 +159,8 @@ def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
 # ── vLLM inference benchmark ─────────────────────────────────────────────────
 
 def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
-                   n_warmup: int, quantization: str = "awq"):
+                   n_warmup: int, quantization: str = "awq",
+                   gpu_memory_utilization: float = 0.8):
     """
     Benchmark vLLM model (AWQ INT4).
     Requires: pip install vllm
@@ -176,7 +177,8 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
         print("  ❌ vLLM not installed. Run: pip install vllm")
         return None
 
-    llm = LLM(model=model_path, quantization=quantization, dtype="float16")
+    llm = LLM(model=model_path, quantization=quantization, dtype="float16",
+              gpu_memory_utilization=gpu_memory_utilization)
     sampling = SamplingParams(temperature=0, max_tokens=n_tokens)
 
     # Measure VRAM after load
@@ -300,6 +302,7 @@ def main():
     parser.add_argument("--n-tokens",    type=int, default=128, help="Tokens to generate per prompt")
     parser.add_argument("--n-warmup",    type=int, default=2,   help="Warmup runs before timing")
     parser.add_argument("--use-long",    action="store_true",   help="Use long prompts instead of short")
+    parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="vLLM gpu_memory_utilization (default: 0.8)")
     args = parser.parse_args()
 
     if not any([args.fp16_path, args.fp16dq_path, args.vllm_path]):
@@ -331,7 +334,8 @@ def main():
 
     if args.vllm_path:
         s = benchmark_vllm(args.vllm_path, f"vLLM AWQ INT4 ({args.vllm_quant})",
-                           prompts, args.n_tokens, args.n_warmup, args.vllm_quant)
+                           prompts, args.n_tokens, args.n_warmup, args.vllm_quant,
+                           gpu_memory_utilization=args.gpu_mem_util)
         summaries.append(s)
         if baseline_label is None:
             baseline_label = f"vLLM AWQ INT4 ({args.vllm_quant})"
