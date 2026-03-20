@@ -28,9 +28,11 @@ Usage:
 """
 
 import argparse
+import json
 import time
 import gc
 import torch
+from pathlib import Path
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -177,8 +179,27 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
         print("  ❌ vLLM not installed. Run: pip install vllm")
         return None
 
-    llm = LLM(model=model_path, quantization=quantization, dtype="float16",
-              gpu_memory_utilization=gpu_memory_utilization)
+    # vLLM 0.17+ validates that config.json quant_method matches quantization arg.
+    # For awq_marlin, temporarily patch config.json then restore after load.
+    config_path = Path(model_path) / "config.json"
+    config_backup = None
+    if quantization == "awq_marlin" and config_path.exists():
+        with open(config_path) as f:
+            config_data = json.load(f)
+        config_backup = json.dumps(config_data, indent=2)
+        if "quantization_config" in config_data:
+            config_data["quantization_config"]["quant_method"] = "awq_marlin"
+            config_data["quantization_config"]["version"] = "marlin"
+        with open(config_path, "w") as f:
+            json.dump(config_data, f, indent=2)
+
+    try:
+        llm = LLM(model=model_path, quantization=quantization, dtype="float16",
+                  gpu_memory_utilization=gpu_memory_utilization)
+    finally:
+        if config_backup is not None:
+            with open(config_path, "w") as f:
+                f.write(config_backup)
     sampling = SamplingParams(temperature=0, max_tokens=n_tokens)
 
     # Measure VRAM after load
