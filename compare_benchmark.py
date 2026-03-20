@@ -475,7 +475,10 @@ def main():
         print(f"  FP16-dequant PPL  : {results['fp16dq_check']['ppl_wikitext2']:.4f}")
 
     if "vllm_check" in results:
-        print(f"  vLLM AWQ PPL      : {results['vllm_check']['ppl_wikitext2']:.4f}")
+        if "ppl_wikitext2" in results["vllm_check"]:
+            print(f"  vLLM AWQ PPL      : {results['vllm_check']['ppl_wikitext2']:.4f}")
+        else:
+            print(f"  vLLM AWQ          : ✅ Load+generate OK")
 
     if "roundtrip_check" in results and results["roundtrip_check"]:
         avg = np.mean([e["mean_err"] for e in results["roundtrip_check"]])
