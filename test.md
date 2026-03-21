@@ -55,6 +55,13 @@ huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct \
     --local-dir-use-symlinks False
 ```
 
+```bash
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='mistralai/Mistral-7B-v0.3', local_dir='./models/Mistral-7B-v0.3', local_dir_use_symlinks=False)"
+```
+solidrust/Mistral-7B-Instruct-v0.3-AWQ
+
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='solidrust/Mistral-7B-v0.3-AWQ', local_dir='./models/Mistral-7B-v0.3-AWQ', local_dir_use_symlinks=False)"
+
 ### Kiểm tra download thành công
 
 ```bash
@@ -227,37 +234,42 @@ python compare_awq_slicing.py \
 
 ### 6a. Mistral-7B: FP16 vs FP16-dequant vs vLLM INT4, batch size 1 và 16
 
+> Mỗi model chạy trong subprocess riêng → CUDA sạch giữa các lần, tránh OOM.
+
 ```bash
 python compare_inference.py \
-    --fp16-path   ./models/Mistral-7B-v0.3 \
-    --fp16dq-path ./quantized_models/mistral_awq_js \
-    --vllm-path   ./quantized_models/mistral_awq_js_vllm \
-    --vllm-quant  awq \
-    --n-tokens    128 \
-    --n-warmup    2 \
-    --batch-sizes 1,16
+    --fp16-path    ./models/Mistral-7B-v0.3 \
+    --fp16dq-path  ./quantized_models/mistral_awq_js \
+    --vllm-path    ./quantized_models/mistral_awq_js_vllm \
+    --vllm-quant   awq \
+    --n-tokens     128 \
+    --n-warmup     2 \
+    --batch-sizes  1,16 \
+    --max-model-len 4096
 ```
 
 > Nếu có model AWQ tải từ HuggingFace (vd: TheBloke/Mistral-7B-v0.3-AWQ):
 > ```bash
 > python compare_inference.py \
->     --fp16-path   ./models/Mistral-7B-v0.3 \
->     --hf-awq-path ./models/Mistral-7B-v0.3-AWQ \
->     --vllm-path   ./quantized_models/mistral_awq_js_vllm \
->     --vllm-quant  awq \
->     --n-tokens    128 \
->     --batch-sizes 1,16
+>     --fp16-path    ./models/Mistral-7B-v0.3 \
+>     --hf-awq-path  ./models/Mistral-7B-v0.3-AWQ \
+>     --vllm-path    ./quantized_models/mistral_awq_js_vllm \
+>     --vllm-quant   awq \
+>     --n-tokens     128 \
+>     --batch-sizes  1,16 \
+>     --max-model-len 4096
 > ```
 
 ### 6b. Thử vLLM với Marlin kernel (nhanh hơn AWQ thường)
 
 ```bash
 python compare_inference.py \
-    --fp16-path   ./models/Mistral-7B-v0.3 \
-    --vllm-path   ./quantized_models/mistral_awq_js_vllm \
-    --vllm-quant  awq_marlin \
-    --n-tokens    256 \
-    --batch-sizes 1,16
+    --fp16-path    ./models/Mistral-7B-v0.3 \
+    --vllm-path    ./quantized_models/mistral_awq_js_vllm \
+    --vllm-quant   awq_marlin \
+    --n-tokens     256 \
+    --batch-sizes  1,16 \
+    --max-model-len 4096
 ```
 
 > Nếu gặp lỗi PTX version mismatch, xem hướng dẫn fix:
@@ -280,12 +292,40 @@ python compare_inference.py \
 
 ```bash
 python compare_inference.py \
-    --fp16-path   ./models/Mistral-7B-v0.3 \
-    --vllm-path   ./quantized_models/mistral_awq_js_vllm \
+    --fp16-path    ./models/Mistral-7B-v0.3 \
+    --vllm-path    ./quantized_models/mistral_awq_js_vllm \
     --use-long \
-    --n-tokens    256 \
-    --batch-sizes 1,16
+    --n-tokens     256 \
+    --batch-sizes  1,16 \
+    --max-model-len 4096
 ```
+
+
+Fix nhanh nhất — chạy tách riêng:                                                        
+                                                            
+  # Chạy 1: chỉ HF models                                                                  
+  python compare_inference.py \                             
+      --fp16-path   ./models/Mistral-7B-v0.3 \                                             
+      --fp16dq-path ./quantized_models/mistral_awq_js \
+      --n-tokens 128 --batch-sizes 1,16                                                    
+                                                            
+  # Chạy 2: chỉ vLLM (process mới = CUDA cache sạch)                                       
+  python compare_inference.py \                             
+      --vllm-path  ./quantized_models/mistral_awq_js_vllm \                                
+      --vllm-quant awq \                                                                   
+      --n-tokens 128 --batch-sizes 1,16                                                    
+                                                                                           
+  Hoặc chạy kết hợp nhưng giảm --gpu-mem-util:                                             
+                                                            
+  python compare_inference.py \                                                            
+      --fp16-path  ./models/Mistral-7B-v0.3 \                                              
+      --vllm-path  ./quantized_models/mistral_awq_js_vllm \                                
+      --n-tokens   128 \                                                                   
+      --batch-sizes 1,16 \                                                                 
+      --gpu-mem-util 0.35   # 0.35 × 24 = 8.4GB, fit trong ~10GB còn lại                   
+                                                                                           
+  ▎ AWQ INT4 model chỉ ~4.5GB nên 0.35 là đủ. Nhưng KV cache cho bs=16 sẽ bị hạn chế — nếu 
+  OOM thì giảm --n-tokens 64.
 
 ---
 
