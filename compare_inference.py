@@ -431,8 +431,8 @@ def main():
         if args.hf_awq_path:
             s = run_subprocess_benchmark(
                 "bench_vllm",
-                dict(model_path=args.hf_awq_path, label="HF AWQ INT4 (vLLM)",
-                     quantization="awq",
+                dict(model_path=args.hf_awq_path, label=f"HF AWQ INT4 ({args.vllm_quant})",
+                     quantization=args.vllm_quant,
                      gpu_memory_utilization=args.gpu_mem_util,
                      max_model_len=args.max_model_len, **base_kwargs),
                 f"HF AWQ INT4 bs={bs}",
