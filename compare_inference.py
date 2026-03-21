@@ -186,7 +186,8 @@ def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
 def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
                    n_warmup: int, quantization: str = "awq",
                    gpu_memory_utilization: float = 0.8,
-                   batch_size: int = 1):
+                   batch_size: int = 1,
+                   max_model_len: int = 4096):
     """
     Benchmark vLLM model.
     Hỗ trợ batch_size > 1: gửi cả batch vào llm.generate() cùng lúc.
@@ -224,7 +225,8 @@ def benchmark_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
 
     try:
         llm = LLM(model=model_path, quantization=quantization, dtype="float16",
-                  gpu_memory_utilization=gpu_memory_utilization)
+                  gpu_memory_utilization=gpu_memory_utilization,
+                  max_model_len=max_model_len)
     except Exception as e:
         if config_backup is not None:
             with open(config_path, "w") as f:
@@ -428,6 +430,8 @@ def main():
                         help="Batch sizes to test, comma-separated (vd: '1,16')")
     parser.add_argument("--gpu-mem-util", type=float, default=0.8,
                         help="vLLM gpu_memory_utilization")
+    parser.add_argument("--max-model-len", type=int, default=4096,
+                        help="vLLM max_model_len (giảm để tiết kiệm KV cache, mặc định 4096)")
     parser.add_argument("--help-marlin",  action="store_true",
                         help="Show guide to fix awq_marlin PTX error")
     args = parser.parse_args()
@@ -479,7 +483,8 @@ def main():
                                args.n_tokens, args.n_warmup,
                                quantization="awq",
                                gpu_memory_utilization=args.gpu_mem_util,
-                               batch_size=bs)
+                               batch_size=bs,
+                               max_model_len=args.max_model_len)
             summaries.append(s)
             if baseline_label is None:
                 baseline_label = "HF AWQ INT4 (vLLM)"
@@ -490,7 +495,8 @@ def main():
                                args.n_tokens, args.n_warmup,
                                quantization=args.vllm_quant,
                                gpu_memory_utilization=args.gpu_mem_util,
-                               batch_size=bs)
+                               batch_size=bs,
+                               max_model_len=args.max_model_len)
             summaries.append(s)
             if baseline_label is None:
                 baseline_label = label
