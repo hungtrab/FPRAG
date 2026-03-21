@@ -82,7 +82,7 @@ def _bench_hf(model_path: str, label: str, prompts: list, n_tokens: int,
     )
     model.eval()
     torch.cuda.synchronize()
-    vram_load_mb = torch.cuda.memory_allocated() / 1024**2
+    vram_load_mb = nvidia_smi_vram_mb()  # total GPU usage, same metric as vLLM
 
     # Warmup
     warmup_batch = make_batch(prompts, min(batch_size, 2))
@@ -102,7 +102,6 @@ def _bench_hf(model_path: str, label: str, prompts: list, n_tokens: int,
         inp = tokenizer(batch, return_tensors="pt", padding=True,
                         truncation=True, max_length=512).to(device)
         input_len = inp["input_ids"].shape[1]
-        torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -110,7 +109,7 @@ def _bench_hf(model_path: str, label: str, prompts: list, n_tokens: int,
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         n_new_total = (out.shape[1] - input_len) * len(batch)
-        peak = torch.cuda.max_memory_allocated() / 1024**2
+        peak = nvidia_smi_vram_mb()  # total GPU usage, same metric as vLLM
         vram_peak_mb = max(vram_peak_mb, peak)
         results.append({
             "throughput": n_new_total / elapsed,
