@@ -302,12 +302,16 @@ def print_table(summaries: list, baseline_label: str = None):
     first_bs = batch_sizes[0]
     group0 = [s for s in valid if s["batch_size"] == first_bs]
     if len(group0) >= 2:
-        print(f"\nVRAM Savings (load, bs={first_bs}):")
+        print(f"\nVRAM (load weights only, bs={first_bs}):")
+        print(f"  Note: vLLM models show higher total VRAM due to KV cache pre-allocation.")
+        print(f"  Compare 'VRAM Load' across HF vs vLLM models carefully.")
         base_vram = group0[0]["vram_load_mb"]
         for s in group0[1:]:
             if base_vram > 0:
-                pct = (base_vram - s["vram_load_mb"]) / base_vram * 100
-                print(f"  {s['label']} vs {group0[0]['label']}: {pct:+.1f}%"
+                delta_mb = s["vram_load_mb"] - base_vram
+                pct = delta_mb / base_vram * 100
+                direction = "more" if delta_mb > 0 else "less"
+                print(f"  {s['label']} vs {group0[0]['label']}: {abs(pct):.1f}% {direction} VRAM"
                       f"  ({base_vram:.0f} → {s['vram_load_mb']:.0f} MB)")
 
 
