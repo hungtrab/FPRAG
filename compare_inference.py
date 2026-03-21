@@ -173,7 +173,10 @@ def benchmark_hf(model_path: str, label: str, prompts: list, n_tokens: int,
     print(f"  Latency    : {summary['latency_mean_ms']:.2f} ± {summary['latency_std_ms']:.2f} ms/tok")
 
     del model
+    # Aggressively free CUDA memory so vLLM subprocess can see it
+    gc.collect()
     torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     gc.collect()
     return summary
 
