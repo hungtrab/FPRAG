@@ -6,6 +6,7 @@ So sánh tốc độ inference giữa:
   2. Custom AWQ FP16 dequantized (output của awq_stand_xl / awq_js_xl, HuggingFace)
   3. HF AWQ INT4 (model AWQ tải từ HuggingFace, dùng vLLM)
   4. Custom AWQ INT4 (output của convert_custom_awq_to_vllm.py, dùng vLLM)
+  5. FLUTE INT3 (output của convert_to_flute_int3.py, dùng vLLM hoặc HF+FLUTE kernels)
 
 Mỗi benchmark chạy trong subprocess riêng → CUDA context sạch hoàn toàn giữa các lần,
 tránh OOM do PyTorch giữ CUDA cache sau khi unload model.
@@ -15,6 +16,8 @@ Usage:
       --fp16-path    ./models/Mistral-7B-v0.3 \\
       --hf-awq-path  ./models/Mistral-7B-v0.3-AWQ \\
       --vllm-path    ./quantized_models/mistral_awq_js_vllm \\
+      --flute-path   ./quantized_models/mistral_flute_int3 \\
+      --flute-num-bits 3 \\
       --batch-sizes  1,16
 """
 
@@ -126,6 +129,133 @@ def _bench_hf(model_path: str, label: str, prompts: list, n_tokens: int,
     }
 
 
+# ── FLUTE benchmark (runs inside worker subprocess) ───────────────────────────
+
+def _bench_flute(model_path: str, label: str, prompts: list, n_tokens: int,
+                 n_warmup: int, num_bits: int, group_size: int,
+                 gpu_memory_utilization: float, batch_size: int,
+                 max_model_len: int) -> dict:
+    """
+    Benchmark FLUTE-quantized model (INT3/INT2/INT4).
+
+    Strategy:
+      1. Try vLLM with flute.integrations.vllm.patch_vllm() + quantization="flute"
+      2. Fall back to native HuggingFace with FLUTE kernels
+         (flute.integrations.huggingface.from_pretrained)
+    """
+    backend_used = "unknown"
+
+    # ── Try vLLM path first ────────────────────────────────────────────────────
+    try:
+        import flute.integrations.vllm as flute_vllm
+        from vllm import LLM, SamplingParams
+
+        flute_vllm.patch_vllm()
+
+        try:
+            llm = LLM(
+                model=model_path,
+                quantization="flute",
+                dtype="float16",
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+            )
+            backend_used = "vllm"
+        except Exception as e:
+            raise RuntimeError(f"vLLM load failed: {e}")
+
+        sampling = SamplingParams(temperature=0, max_tokens=n_tokens)
+        vram_load_mb = nvidia_smi_vram_mb()
+
+        warmup_batch = make_batch(prompts, min(batch_size, 2))
+        for _ in range(n_warmup):
+            llm.generate(warmup_batch, SamplingParams(temperature=0, max_tokens=16))
+
+        bench_batches = (
+            [[p] for p in prompts] if batch_size == 1
+            else [make_batch(prompts, batch_size)] * 5
+        )
+        results = []
+        vram_peak_mb = 0
+        for batch in bench_batches:
+            t0 = time.perf_counter()
+            outputs = llm.generate(batch, sampling)
+            elapsed = time.perf_counter() - t0
+            n_new_total = sum(len(o.outputs[0].token_ids) for o in outputs)
+            avg_per_seq = n_new_total / len(batch)
+            peak = nvidia_smi_vram_mb()
+            vram_peak_mb = max(vram_peak_mb, peak)
+            results.append({
+                "throughput": n_new_total / elapsed,
+                "latency_ms_per_token": elapsed / avg_per_seq * 1000,
+            })
+
+    except Exception as vllm_err:
+        # ── Fall back to HuggingFace + FLUTE kernels ───────────────────────────
+        try:
+            from flute.integrations.huggingface import from_pretrained
+        except ImportError:
+            return {"error": f"FLUTE not installed. Run: pip install flute-kernel jaxtyping"}
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            model = from_pretrained(model_path, device_map="auto")
+        except Exception as e:
+            return {"error": f"FLUTE HF load failed: {e}  (vLLM also failed: {vllm_err})"}
+
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        model.eval()
+        torch.cuda.synchronize()
+        backend_used = "hf"
+        vram_load_mb = nvidia_smi_vram_mb()
+
+        warmup_batch = make_batch(prompts, min(batch_size, 2))
+        for _ in range(n_warmup):
+            inp = tokenizer(warmup_batch, return_tensors="pt", padding=True,
+                            truncation=True, max_length=512).to(device)
+            with torch.no_grad():
+                model.generate(**inp, max_new_tokens=16, do_sample=False)
+        torch.cuda.synchronize()
+
+        bench_batches = (
+            [[p] for p in prompts] if batch_size == 1
+            else [make_batch(prompts, batch_size)] * 5
+        )
+        results = []
+        vram_peak_mb = 0
+        for batch in bench_batches:
+            inp = tokenizer(batch, return_tensors="pt", padding=True,
+                            truncation=True, max_length=512).to(device)
+            input_len = inp["input_ids"].shape[1]
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                out = model.generate(**inp, max_new_tokens=n_tokens,
+                                     do_sample=False, use_cache=True)
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+            n_new_total = (out.shape[1] - input_len) * len(batch)
+            peak = nvidia_smi_vram_mb()
+            vram_peak_mb = max(vram_peak_mb, peak)
+            results.append({
+                "throughput": n_new_total / elapsed,
+                "latency_ms_per_token": elapsed / (out.shape[1] - input_len) * 1000,
+            })
+
+    tps = [r["throughput"] for r in results]
+    lat = [r["latency_ms_per_token"] for r in results]
+    return {
+        "label": f"{label} ({backend_used})", "batch_size": batch_size,
+        "vram_load_mb": vram_load_mb, "vram_peak_mb": vram_peak_mb,
+        "throughput_mean": float(np.mean(tps)), "throughput_std": float(np.std(tps)),
+        "latency_mean_ms": float(np.mean(lat)), "latency_std_ms": float(np.std(lat)),
+    }
+
+
 # ── vLLM benchmark (runs inside worker subprocess) ────────────────────────────
 
 def _bench_vllm(model_path: str, label: str, prompts: list, n_tokens: int,
@@ -221,6 +351,8 @@ def _worker_main():
         result = _bench_hf(**kwargs)
     elif func == "bench_vllm":
         result = _bench_vllm(**kwargs)
+    elif func == "bench_flute":
+        result = _bench_flute(**kwargs)
     else:
         result = {"error": f"Unknown func: {func}"}
 
@@ -361,6 +493,10 @@ def main():
     parser.add_argument("--vllm-quant",   type=str, default="awq",
                         choices=["awq", "awq_marlin"],
                         help="vLLM quantization backend cho --vllm-path")
+    parser.add_argument("--flute-path",   type=str, default="",
+                        help="FLUTE-quantized model (convert_to_flute_int3.py output)")
+    parser.add_argument("--flute-num-bits", type=int, default=3, choices=[2, 3, 4],
+                        help="Bit width of the FLUTE model")
     parser.add_argument("--n-tokens",     type=int, default=128,
                         help="Tokens to generate per sequence")
     parser.add_argument("--n-warmup",     type=int, default=2,
@@ -381,8 +517,10 @@ def main():
         print_marlin_help()
         return
 
-    if not any([args.fp16_path, args.fp16dq_path, args.hf_awq_path, args.vllm_path]):
-        parser.error("Provide at least one of --fp16-path, --fp16dq-path, --hf-awq-path, --vllm-path")
+    if not any([args.fp16_path, args.fp16dq_path, args.hf_awq_path,
+                args.vllm_path, args.flute_path]):
+        parser.error("Provide at least one of --fp16-path, --fp16dq-path, "
+                     "--hf-awq-path, --vllm-path, --flute-path")
 
     batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",")]
     prompts = LONG_PROMPTS if args.use_long else SHORT_PROMPTS
@@ -450,6 +588,20 @@ def main():
                      gpu_memory_utilization=args.gpu_mem_util,
                      max_model_len=args.max_model_len, **base_kwargs),
                 f"Custom AWQ INT4 bs={bs}",
+            )
+            summaries.append(s)
+            if baseline_label is None:
+                baseline_label = label
+
+        if args.flute_path:
+            label = f"FLUTE INT{args.flute_num_bits}"
+            s = run_subprocess_benchmark(
+                "bench_flute",
+                dict(model_path=args.flute_path, label=label,
+                     num_bits=args.flute_num_bits, group_size=128,
+                     gpu_memory_utilization=args.gpu_mem_util,
+                     max_model_len=args.max_model_len, **base_kwargs),
+                f"FLUTE INT{args.flute_num_bits} bs={bs}",
             )
             summaries.append(s)
             if baseline_label is None:
