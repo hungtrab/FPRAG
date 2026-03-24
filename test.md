@@ -207,20 +207,13 @@ python convert_custom_awq_to_vllm.py \
 python convert_to_flute_int3.py \
     --model-path ./models/Mistral-7B-v0.3 \
     --output-dir ./quantized_models/mistral_flute_int3 \
-    --num-bits 3 --group-size 128 --n-calib 128
+    --num-bits 3 --group-size 128
 
 # Llama-3-8B → FLUTE INT3
 python convert_to_flute_int3.py \
     --model-path ./models/Llama-3-8B-Instruct \
     --output-dir ./quantized_models/llama3_flute_int3 \
-    --num-bits 3 --group-size 128 --n-calib 128
-
-# Tuỳ chọn: thêm --learn-scales để fine-tune scales trên calib data (+quality, +time)
-python convert_to_flute_int3.py \
-    --model-path ./models/Mistral-7B-v0.3 \
-    --output-dir ./quantized_models/mistral_flute_int3 \
-    --num-bits 3 --group-size 128 --n-calib 128 \
-    --learn-scales
+    --num-bits 3 --group-size 128
 ```
 
 ---
