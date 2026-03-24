@@ -15,9 +15,15 @@ pip install torch transformers datasets safetensors tqdm psutil scipy jaxtyping
 # vLLM (cần cho convert AWQ INT4 + inference benchmark)
 pip install vllm
 
-# FLUTE (cần cho INT3 inference — chọn đúng CUDA version)
-pip install flute-kernel -i https://flute-ai.github.io/whl/cu124   # CUDA 12.4
-pip install flute-kernel                                            # CUDA 12.1 (default)
+# FLUTE (cần cho INT3 inference)
+# Prebuilt wheel chỉ có đến CUDA 12.4 — nếu dùng CUDA 12.8+ thì build từ source:
+git clone https://github.com/HanGuo97/flute --recursive
+cd flute
+TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0" pip install -e .
+cd ..
+
+# Nếu CUDA <= 12.4 thì dùng wheel cho nhanh:
+# pip install flute-kernel -i https://flute-ai.github.io/whl/cu124
 
 # HuggingFace Hub (cần cho download)
 pip install huggingface_hub
@@ -496,6 +502,24 @@ python awq_js_xl.py \
 python -c "import torch; print(torch.cuda.get_device_capability())"
 # Cần (8, 0) trở lên — A100, RTX 30xx/40xx, A6000
 # RTX 20xx (sm_75) không được hỗ trợ
+```
+
+### FLUTE không có prebuilt wheel cho CUDA 12.8+
+
+```bash
+# Build từ source thay vì dùng pip install flute-kernel
+git clone https://github.com/HanGuo97/flute --recursive
+cd flute
+
+# Kiểm tra CUDA version của PyTorch
+python -c "import torch; print(torch.version.cuda)"  # phải khớp với nvcc --version
+
+# Build (thêm SM của GPU bạn đang dùng)
+TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0" pip install -e .
+
+# Nếu submodule trống (CUTLASS missing)
+git submodule update --init --recursive
+TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0" pip install -e .
 ```
 
 ### vLLM AWQ Marlin PTX mismatch (CUDA < 12.5)
