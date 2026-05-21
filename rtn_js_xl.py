@@ -55,6 +55,8 @@ import argparse
 import random
 import numpy as np
 import gc
+import hashlib
+import time
 
 try:
     import psutil
@@ -161,8 +163,9 @@ class RTN_JS_Heuristic_XL_Quantizer:
         self.layer_batch_size = layer_batch_size
         self.lmhead_chunks = lmhead_chunks
 
-        self.activation_data = {}    # name -> list[CPU float32 tensor]
-        self.layer_stats = {}        # name -> dict
+        self.activation_data = {}     # name -> list[CPU float32 tensor]
+        self.activation_means = {}    # name -> CPU float32 tensor, reusable across k/f
+        self.layer_stats = {}         # name -> dict
 
         max_int = 2 ** bits - 1
         print(f"\n[RTN + James-Stein + Heuristic Rounding (XL) Initialized]")
@@ -179,6 +182,12 @@ class RTN_JS_Heuristic_XL_Quantizer:
         print(f"  lm_head chunks:       {lmhead_chunks}")
         print(f"  Tokens per sample:    {max_tokens_per_sample}")
         print(f"  Quantization:         GROUP-WISE ASYMMETRIC [0, {max_int}]")
+
+    @staticmethod
+    def fmt_seconds(seconds):
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        return f"{seconds / 60:.1f}m"
 
     # ----- activation hook ---------------------------------------------------
 
@@ -198,6 +207,10 @@ class RTN_JS_Heuristic_XL_Quantizer:
     @torch.no_grad()
     def get_activation_mean(self, name, in_features):
         """Return [in_features] CPU float32 tensor of E[X], JS-shrunk if enabled."""
+        if name in self.activation_means:
+            cached = self.activation_means[name]
+            if cached.numel() == in_features:
+                return cached
         if name not in self.activation_data or len(self.activation_data[name]) == 0:
             return None
         mean_sum = torch.zeros(in_features, dtype=torch.float32)
@@ -428,6 +441,8 @@ class RTN_JS_Heuristic_XL_Quantizer:
 
         if name in self.activation_data:
             del self.activation_data[name]
+        if name in self.activation_means:
+            del self.activation_means[name]
         del ex_mean, W_dq
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -504,6 +519,8 @@ class RTN_JS_Heuristic_XL_Quantizer:
 
         if name in self.activation_data:
             del self.activation_data[name]
+        if name in self.activation_means:
+            del self.activation_means[name]
         del ex_mean, W_chunks, W_final
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -518,6 +535,7 @@ class RTN_JS_Heuristic_XL_Quantizer:
 
     def calibrate_layer_batch(self, layer_batch, calibration_texts, n_samples):
         self.activation_data = {}
+        self.activation_means = {}
         handles = [m.register_forward_hook(self.get_hook(n)) for n, m in layer_batch]
 
         successful = 0
@@ -543,9 +561,48 @@ class RTN_JS_Heuristic_XL_Quantizer:
         if successful == 0:
             print("⚠️  No successful calibration passes in this batch.")
 
+    def load_calibration_batch_cache(self, cache_path, expected_names):
+        if not cache_path or not os.path.isfile(cache_path):
+            return False
+        try:
+            payload = torch.load(cache_path, map_location="cpu")
+            means = payload.get("activation_means", payload)
+            if not isinstance(means, dict):
+                return False
+            missing = [name for name in expected_names if name not in means]
+            if missing:
+                print(f"  Calibration cache incomplete ({len(missing)} missing); recalibrating.")
+                return False
+            self.activation_data = {}
+            self.activation_means = {name: means[name].cpu().float() for name in expected_names}
+            print(f"  Calibration cache hit: {cache_path}")
+            return True
+        except Exception as exc:
+            print(f"  Calibration cache unreadable ({exc}); recalibrating.")
+            return False
+
+    def save_calibration_batch_cache(self, cache_path, batch):
+        if not cache_path:
+            return
+        means = {}
+        for name, module, _is_lmhead in batch:
+            in_features = module.weight.data.shape[1]
+            mean = self.get_activation_mean(name, in_features)
+            if mean is not None:
+                means[name] = mean.cpu().float()
+        if not means:
+            return
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        torch.save({"activation_means": means}, tmp_path)
+        os.replace(tmp_path, cache_path)
+        self.activation_means = means
+        print(f"  Saved calibration cache: {cache_path}")
+
     # ----- top-level driver --------------------------------------------------
 
-    def quantize_model(self, calibration_texts, n_samples=128):
+    def quantize_model(self, calibration_texts, n_samples=128,
+                       calib_cache_dir=None, calib_cache_key=None):
         print("\n" + "=" * 80)
         print("Batched Sequential RTN + JS + Heuristic Rounding")
         print("=" * 80)
@@ -573,10 +630,25 @@ class RTN_JS_Heuristic_XL_Quantizer:
             e = min(s + self.layer_batch_size, n_total)
             batch = layers_to_q[s:e]
             batch_for_hooks = [(n, m) for n, m, _ in batch]
+            batch_names = [n for n, _m, _is_lmhead in batch]
+            cache_path = None
+            if calib_cache_dir and calib_cache_key:
+                cache_path = os.path.join(
+                    calib_cache_dir,
+                    f"{calib_cache_key}_batch{b:03d}_{s:04d}_{e-1:04d}.pt",
+                )
 
             print(f"\n[Batch {b+1}/{n_batches}] Layers {s}-{e-1}")
-            self.calibrate_layer_batch(batch_for_hooks, calibration_texts, n_samples)
+            batch_start = time.time()
+            if not self.load_calibration_batch_cache(cache_path, batch_names):
+                calib_start = time.time()
+                self.calibrate_layer_batch(batch_for_hooks, calibration_texts, n_samples)
+                print(f"  Calibration time: {self.fmt_seconds(time.time() - calib_start)}")
+                self.save_calibration_batch_cache(cache_path, batch)
+            else:
+                print("  Calibration time: cache hit")
 
+            quant_start = time.time()
             for name, module, is_lmhead in tqdm(batch, desc="  Quantize", leave=False):
                 try:
                     if is_lmhead:
@@ -587,6 +659,7 @@ class RTN_JS_Heuristic_XL_Quantizer:
                 except Exception as exc:
                     print(f"\n⚠️  Error on {name}: {exc}")
                     continue
+            print(f"  Quantize time: {self.fmt_seconds(time.time() - quant_start)}")
 
             self.activation_data = {}
             if torch.cuda.is_available():
@@ -595,6 +668,7 @@ class RTN_JS_Heuristic_XL_Quantizer:
 
             if HAS_PSUTIL:
                 print(f"  RAM after batch {b+1}: {psutil.virtual_memory().percent:.1f}%")
+            print(f"  Batch time: {self.fmt_seconds(time.time() - batch_start)}")
 
         # ----- summary -------------------------------------------------------
         print("\n" + "=" * 80)
@@ -632,6 +706,22 @@ def load_wikitext2_simple(n_samples=128):
     ds = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
     texts = [item['text'] for item in ds if len(item['text'].strip()) > 100]
     return texts[:n_samples]
+
+
+def make_calibration_cache_key(args):
+    model_id = os.path.abspath(args.model_path) if os.path.exists(args.model_path) else args.model_path
+    model_hash = hashlib.sha1(model_id.encode("utf-8")).hexdigest()[:12]
+    model_name = os.path.basename(str(args.model_path).rstrip("/")).replace(".", "p").replace("-", "_")
+    return (
+        f"{model_name}_{model_hash}"
+        f"_dataset{args.calib_dataset}"
+        f"_n{args.n_calib}"
+        f"_seq{args.max_tokens_per_sample}"
+        f"_seed{args.seed}"
+        f"_js{int(args.use_james_stein)}"
+        f"_skiplm{int(args.skip_lm_head)}"
+        f"_lbs{args.layer_batch_size}"
+    )
 
 
 def main():
@@ -672,6 +762,8 @@ def main():
     parser.add_argument("--calib-dataset", type=str, default="c4",
                         choices=["c4", "wikitext2", "wikitext2-simple"])
     parser.add_argument("--cache-dir", type=str, default="./calibration_cache")
+    parser.add_argument("--no-calib-cache", action="store_true",
+                        help="Disable reusable activation-mean calibration cache.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -692,9 +784,14 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    model_dtype = torch.float32
+    if torch.cuda.is_available():
+        model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"Model dtype: {model_dtype}")
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=model_dtype,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -724,13 +821,26 @@ def main():
         layer_batch_size=args.layer_batch_size,
         lmhead_chunks=args.lmhead_chunks,
     )
-    quantizer.quantize_model(calib_texts, n_samples=args.n_calib)
+    calib_cache_dir = None
+    calib_cache_key = None
+    if not args.no_calib_cache:
+        calib_cache_dir = os.path.join(args.cache_dir, "rtn_js_xl_activation_means")
+        calib_cache_key = make_calibration_cache_key(args)
+        print(f"Calibration mean cache: {calib_cache_dir}/{calib_cache_key}_batch*.pt")
+
+    quantizer.quantize_model(
+        calib_texts,
+        n_samples=args.n_calib,
+        calib_cache_dir=calib_cache_dir,
+        calib_cache_key=calib_cache_key,
+    )
 
     os.makedirs(args.output_dir, exist_ok=True)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"\n✅ Saved to {args.output_dir}")
+    print(f"\n✅ Saved to {args.output_dir}") 
 
 
 if __name__ == "__main__":
     main()
+
